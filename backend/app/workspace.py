@@ -1,4 +1,8 @@
-"""工作区：以源视频命名，落盘阶段产物与阶段清单、说话人命名元数据。"""
+"""工作区：以源视频命名，落盘阶段产物与阶段清单、说话人命名元数据。
+
+阶段清单是断点续跑与同源复用的依据：哪些阶段已完成、产物在哪、属于哪一份
+分析（源视频路径与体积 + 音轨选择），全部以清单为准，任务内存状态不作数。
+"""
 
 from __future__ import annotations
 
@@ -6,11 +10,21 @@ import hashlib
 import json
 import os
 import re
+import shutil
 from pathlib import Path
 
 _MANIFEST = "manifest.json"
 _SPEAKER_NAMES = "speaker_names.json"
 _UNSAFE = re.compile(r"[^\w.\-]", re.UNICODE)
+
+MANIFEST_VERSION = 1
+
+# 分析阶段（①–④）：产物昂贵且与目标说话人无关，可跨任务复用
+ANALYSIS_STAGES = ("audio_extract", "separate", "diarize", "transcribe")
+
+
+class WorkspaceNotFound(Exception):
+    """工作区不存在，或名字越出了工作区根目录。"""
 
 
 def sanitize_stem(stem: str) -> str:
@@ -51,6 +65,64 @@ def write_manifest(ws: Path, manifest: dict) -> None:
     os.replace(tmp, path)
 
 
+def source_path(manifest: dict | None) -> str | None:
+    source = (manifest or {}).get("source")
+    return source.get("path") if isinstance(source, dict) else None
+
+
+def is_for_source(
+    manifest: dict | None, video_path: str, audio_track: int | None
+) -> bool:
+    """清单是否属于同一份分析：同源视频、同音轨选择。
+
+    源视频按路径 + 体积认定：同路径被换成另一个文件时，提取出的音频与
+    分离、说话人分离结果全都不再对应，复用会把旧音频的擦除结果封装进新
+    视频。不比 mtime——复制/还原同一个文件就改 mtime，白丢数小时的产物。
+    换了音轨同样是另一份分析（提取出的音频不同）。
+    """
+    if not isinstance(manifest, dict) or manifest.get("version") != MANIFEST_VERSION:
+        return False
+    source = manifest.get("source")
+    if not isinstance(source, dict) or source.get("path") != str(video_path):
+        return False
+    try:
+        size = Path(video_path).stat().st_size
+    except OSError:
+        return False
+    return (
+        source.get("size_bytes") == size
+        and manifest.get("requested_audio_track") == audio_track
+    )
+
+
+def done_stages(ws: Path, manifest: dict | None) -> set[str]:
+    """清单中标记完成、且产物文件齐全的阶段 id。
+
+    产物缺失（被清理、写入中断）按未完成处理：宁可重算，也不能拿着不
+    存在的产物继续跑。
+    """
+    if not isinstance(manifest, dict):
+        return set()
+    ws = Path(ws)
+    done: set[str] = set()
+    for entry in manifest.get("stages") or []:
+        if not isinstance(entry, dict) or entry.get("status") != "done":
+            continue
+        stage_id = entry.get("id")
+        if not isinstance(stage_id, str):
+            continue
+        artifacts = list(entry.get("artifacts") or [])
+        artifacts += list((entry.get("outputs") or {}).values())
+        if all(isinstance(a, str) and a and (ws / a).is_file() for a in artifacts):
+            done.add(stage_id)
+    return done
+
+
+def analysis_reusable(ws: Path, manifest: dict | None) -> bool:
+    """四个分析阶段是否齐全（同源新任务可直接复用，几分钟出新成品）。"""
+    return set(ANALYSIS_STAGES) <= done_stages(ws, manifest)
+
+
 def read_speaker_names(ws: Path) -> dict[str, str]:
     """说话人命名元数据：{说话人编号标签: 名字}；损坏或缺失视为未命名。
 
@@ -76,3 +148,46 @@ def write_speaker_names(ws: Path, names: dict[str, str]) -> None:
         encoding="utf-8",
     )
     os.replace(tmp, path)
+
+
+def resolve(root: Path, name: str) -> Path:
+    """把工作区名字解析为根目录下的真实子目录。
+
+    名字来自 HTTP 路径，越出根目录（`..`、绝对路径）一律按不存在处理：
+    删除是不可逆操作，只允许作用于工作区根目录的直接子目录。
+    """
+    root = Path(root).resolve()
+    ws = (root / name).resolve()
+    if ws == root or ws.parent != root or not ws.is_dir():
+        raise WorkspaceNotFound(name)
+    return ws
+
+
+def list_workspaces(root: Path) -> list[Path]:
+    root = Path(root)
+    if not root.is_dir():
+        return []
+    return sorted((p for p in root.iterdir() if p.is_dir()), key=lambda p: p.name)
+
+
+def size_bytes(path: Path) -> int:
+    """目录树占用的字节数（不跟随符号链接）。"""
+    total = 0
+    for dirpath, _dirnames, filenames in os.walk(path):
+        for name in filenames:
+            try:
+                total += os.lstat(os.path.join(dirpath, name)).st_size
+            except OSError:
+                continue  # 正在被任务写入或清理的产物：跳过即可
+    return total
+
+
+def delete(ws: Path) -> None:
+    shutil.rmtree(ws)
+
+
+def format_bytes(n: float) -> str:
+    for unit, scale in (("GB", 1e9), ("MB", 1e6), ("KB", 1e3)):
+        if n >= scale:
+            return f"{n / scale:.1f} {unit}"
+    return f"{n:.0f} B"

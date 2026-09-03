@@ -329,6 +329,20 @@ def get_task(client: TestClient, task_id: str) -> dict:
     return resp.json()
 
 
+def statuses(task: dict) -> dict[str, str]:
+    """任务快照的阶段状态表 {阶段 id: 状态}。"""
+    return {s["id"]: s["status"] for s in task["stages"]}
+
+
+def stage_of(task: dict, stage_id: str) -> dict:
+    return next(s for s in task["stages"] if s["id"] == stage_id)
+
+
+def call_counts(*doubles) -> tuple[int, ...]:
+    """ML 推理替身的调用计数：断言"已完成阶段零调用"用。"""
+    return tuple(len(d.calls) for d in doubles)
+
+
 def audio_bitrate(path: Path) -> int:
     """成品音频的实际码率（bps）。流级码率缺失（如 MKV）时汇总音频包估算。"""
     info = probe(path)

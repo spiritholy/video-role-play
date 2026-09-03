@@ -97,6 +97,22 @@ interface ProbeTrack {
   language: string | null;
 }
 
+interface WorkspaceItem {
+  name: string;
+  path: string;
+  source_path: string | null;
+  size_bytes: number;
+  size_label: string;
+  reusable: boolean;
+  busy: boolean;
+}
+
+interface WorkspaceList {
+  workspaces: WorkspaceItem[];
+  total_bytes: number;
+  total_label: string;
+}
+
 interface ProbeResult {
   container: string;
   duration: number;
@@ -140,6 +156,9 @@ function workspaceKey(t: Task): string {
 
 export default function App() {
   const [tasks, setTasks] = useState<Task[]>([]);
+  const [workspaces, setWorkspaces] = useState<WorkspaceList | null>(null);
+  const [workspaceError, setWorkspaceError] = useState<string | null>(null);
+  const [resumeError, setResumeError] = useState<string | null>(null);
   const [timelines, setTimelines] = useState<Record<string, TimelineOrError>>({});
   // 说话人命名（工作区元数据的本地镜像）：工作区 → 编号标签 → 名字。
   // 按工作区键控：命名是工作区级数据，同源多任务卡片共享同一份显示。
@@ -236,6 +255,16 @@ export default function App() {
     [],
   );
 
+  const refreshWorkspaces = useCallback(async () => {
+    try {
+      const resp = await fetch("/api/workspaces");
+      if (!resp.ok) return;
+      setWorkspaces(await resp.json());
+    } catch {
+      // 后端暂不可达时保留旧列表，下一轮重试
+    }
+  }, []);
+
   const refresh = useCallback(async () => {
     try {
       const resp = await fetch("/api/tasks");
@@ -246,7 +275,8 @@ export default function App() {
     } catch {
       // 后端暂不可达时保留旧列表，下一轮重试
     }
-  }, [maybeFetchTimeline, maybeFetchTranscripts]);
+    refreshWorkspaces();
+  }, [maybeFetchTimeline, maybeFetchTranscripts, refreshWorkspaces]);
 
   useEffect(() => {
     refresh();
@@ -329,6 +359,45 @@ export default function App() {
 
   async function handleCancel(id: string) {
     await fetch(`/api/tasks/${id}/cancel`, { method: "POST" });
+    refresh();
+  }
+
+  async function handleResume(id: string) {
+    setResumeError(null);
+    try {
+      const resp = await fetch(`/api/tasks/${id}/resume`, { method: "POST" });
+      if (!resp.ok) {
+        const data = await resp.json().catch(() => null);
+        setResumeError(data?.detail ?? "续跑失败");
+        return;
+      }
+    } catch {
+      setResumeError("无法连接后端服务");
+      return;
+    }
+    refresh();
+  }
+
+  async function handleDeleteWorkspace(w: WorkspaceItem) {
+    const confirmed = window.confirm(
+      `删除工作区「${w.name}」？\n\n释放 ${w.size_label}，` +
+        `全部中间产物一并删除。\n再次处理该源视频需要从头分析（数小时）。`,
+    );
+    if (!confirmed) return;
+    setWorkspaceError(null);
+    try {
+      const resp = await fetch(`/api/workspaces/${encodeURIComponent(w.name)}`, {
+        method: "DELETE",
+      });
+      if (!resp.ok) {
+        const data = await resp.json().catch(() => null);
+        setWorkspaceError(data?.detail ?? "删除工作区失败");
+        return;
+      }
+    } catch {
+      setWorkspaceError("无法连接后端服务");
+      return;
+    }
     refresh();
   }
 
@@ -433,9 +502,11 @@ export default function App() {
 
       <section className="tasks">
         <h2>处理任务</h2>
+        {resumeError && <p className="error-text">{resumeError}</p>}
         {tasks.length === 0 && <p className="empty">还没有任务，提交一个源视频开始。</p>}
         {tasks.map((t) => {
           const cancellable = t.state === "queued" || t.state === "running";
+          const resumable = t.state === "failed" || t.state === "cancelled";
           return (
             <div key={t.id} className={`task-card state-${t.state}`}>
               <div className="task-head">
@@ -444,6 +515,11 @@ export default function App() {
                 {cancellable && (
                   <button className="cancel" onClick={() => handleCancel(t.id)}>
                     取消
+                  </button>
+                )}
+                {resumable && (
+                  <button className="resume" onClick={() => handleResume(t.id)}>
+                    继续
                   </button>
                 )}
               </div>
@@ -463,6 +539,11 @@ export default function App() {
                   ))}
                 </span>
               </div>
+              {resumable && (
+                <p className="task-hint">
+                  已完成阶段的产物保留在工作区，点“继续”从断点阶段跑起，不重算分离与说话人分离。
+                </p>
+              )}
               {t.stages.filter((s) => s.status === "done" && Object.keys(s.outputs).length > 0)
                 .map((s) => (
                   <div key={s.id} className="stems">
@@ -489,6 +570,41 @@ export default function App() {
             </div>
           );
         })}
+      </section>
+
+      <section className="workspaces">
+        <h2>工作区{workspaces ? `（共占用 ${workspaces.total_label}）` : ""}</h2>
+        {workspaceError && <p className="error-text">{workspaceError}</p>}
+        {workspaces && workspaces.workspaces.length === 0 && (
+          <p className="empty">
+            还没有工作区。任务开始运行后，中间产物会写入工作区目录，可在此手动删除释放磁盘。
+          </p>
+        )}
+        {workspaces?.workspaces.map((w) => (
+          <div key={w.name} className="workspace-row">
+            <div className="workspace-main">
+              <span className="workspace-name">{w.name}</span>
+              <span className="workspace-size">{w.size_label}</span>
+              <span className={`workspace-tag${w.reusable ? " tag-reusable" : ""}`}>
+                {w.reusable ? "分析可复用" : "分析未完成"}
+              </span>
+              {w.busy && <span className="workspace-tag tag-busy">任务使用中</span>}
+              <button
+                className="delete"
+                disabled={w.busy}
+                title={
+                  w.busy
+                    ? "任务正在使用该工作区，取消任务后再删除"
+                    : `删除工作区，释放 ${w.size_label}`
+                }
+                onClick={() => handleDeleteWorkspace(w)}
+              >
+                删除
+              </button>
+            </div>
+            <div className="workspace-path">{w.source_path ?? w.path}</div>
+          </div>
+        ))}
       </section>
     </main>
   );

@@ -5,6 +5,12 @@ ML 阶段经统一 ML 推理接口（inference.Inference）调用，生产为 De
 pyannote / Whisper、测试注入 canned 输出；工作区阶段清单为断点续跑与
 复用提供结构。擦除语义按 ADR-0001：掩码 = 目标说话人时段之并集，只作用
 于人声轨，重叠时段整段擦除（目标优先），伴奏轨原样保留。
+
+阶段跳过一律以工作区清单为准（workspace.done_stages：清单标记完成且产物
+文件齐全）：任务中断/取消/失败后重跑从断点阶段继续，同一源视频的新任务
+直接复用四个分析阶段的产物。任务内存里的阶段状态不作数——工作区被删过
+之后它是过期的。阶段产物是链式的：某阶段一旦要重算，其后阶段的产物一并
+作废重做（_adopt_chain），不留旧分析的描述被静默复用。
 """
 
 from __future__ import annotations
@@ -19,7 +25,7 @@ import threading
 from typing import Iterable
 
 from . import workspace
-from .inference import DiarizationResult, Inference, SeparationStems
+from .inference import DiarizationResult, Inference, SeparationStems, SpeakerSegment
 from .media import TaskCancelled, TaskError, audio_tracks, ffprobe_json, run_ffmpeg
 from .models import StageStatus, now_iso
 from .samples import select_samples
@@ -53,13 +59,6 @@ def _disk_free(path: Path) -> int:
     return shutil.disk_usage(path).free
 
 
-def _fmt_bytes(n: float) -> str:
-    for unit, scale in (("GB", 1e9), ("MB", 1e6), ("KB", 1e3)):
-        if n >= scale:
-            return f"{n / scale:.1f} {unit}"
-    return f"{n:.0f} B"
-
-
 def ensure_disk_space(src: Path, workspace_root: Path) -> None:
     """任务启动前磁盘预检：按源视频体积估算工作区需求，不足立即失败。
 
@@ -73,41 +72,22 @@ def ensure_disk_space(src: Path, workspace_root: Path) -> None:
     free = _disk_free(workspace_root)
     if free < need:
         raise TaskError(
-            f"磁盘空间不足：任务需要约 {_fmt_bytes(need)}"
-            f"（源视频 {_fmt_bytes(size)} × {WORKSPACE_FACTOR}），"
-            f"工作区所在磁盘仅剩 {_fmt_bytes(free)}"
+            f"磁盘空间不足：任务需要约 {workspace.format_bytes(need)}"
+            f"（源视频 {workspace.format_bytes(size)} × {WORKSPACE_FACTOR}），"
+            f"工作区所在磁盘仅剩 {workspace.format_bytes(free)}"
         )
 
 
 def run_analysis(task, ctx: RunContext) -> None:
-    """运行分析阶段（①–④）；取消/失败时保留已完成产物并写入阶段清单。"""
+    """运行分析阶段（①–④）；已完成阶段按工作区清单跳过。
+
+    取消/失败时保留已完成产物并写入阶段清单，供续跑或同源新任务复用。
+    """
     src = Path(task.video_path)
     ensure_disk_space(src, ctx.workspace_root)
     ws = workspace.prepare(ctx.workspace_root, task.video_path)
     task.workspace_dir = str(ws)
-    manifest = {
-        "version": 1,
-        "source": {"path": str(src), "container": src.suffix.lower()},
-        "requested_audio_track": task.audio_track,
-        "audio_track": None,
-        "separation": None,
-        "diarization": None,
-        "transcription": None,
-        "erase": None,
-        "output": None,
-        "state": "running",
-        "error": None,
-        "stages": [
-            {
-                "id": s.id,
-                "name": s.name,
-                "status": StageStatus.PENDING.value,
-                "artifacts": [],
-                "outputs": {},
-            }
-            for s in task.stages
-        ],
-    }
+    manifest = _resume_manifest(task, ws, src)
     _check_cancelled(ctx.cancel_event)
 
     def stages():
@@ -120,7 +100,11 @@ def run_analysis(task, ctx: RunContext) -> None:
 
 
 def run_erase(task, ctx: RunContext) -> None:
-    """运行擦除阶段（⑤–⑥）：读取工作区分析产物，掩码合成后编码封装。"""
+    """运行擦除阶段（⑤–⑥）：读取工作区分析产物，掩码合成后编码封装。
+
+    目标说话人与上次合成一致且擦除混音仍在工作区时跳过掩码合成（续跑
+    失败/取消的擦除、同目标重复擦除）；编码封装总是重跑，成品总是新的。
+    """
     src = Path(task.video_path)
     ensure_disk_space(src, ctx.workspace_root)
     ws = Path(task.workspace_dir or "")
@@ -129,7 +113,7 @@ def run_erase(task, ctx: RunContext) -> None:
         raise TaskError("工作区缺少说话人分离产物，无法擦除")
     erase_req = task.erase or {}
     targets = [str(s) for s in erase_req.get("speakers", [])]
-    _reset_erase_stages(task, manifest)
+    _prepare_erase_stages(task, ws, manifest, targets)
     manifest["state"] = "running"
     manifest["error"] = None
     _check_cancelled(ctx.cancel_event)
@@ -168,10 +152,104 @@ def _run_stages(task, manifest: dict, stages) -> None:
         workspace.write_manifest(Path(task.workspace_dir), manifest)
 
 
-def _reset_erase_stages(task, manifest: dict) -> None:
-    """重新发起擦除时把 ⑤–⑥ 复位为待运行（上次擦除的产物将被重做）。"""
-    for stage_id in ("mask_erase", "encode_mux"):
-        stage = next(s for s in task.stages if s.id == stage_id)
+def _new_manifest(task, src: Path) -> dict:
+    return {
+        "version": workspace.MANIFEST_VERSION,
+        "source": {
+            "path": str(src),
+            "container": src.suffix.lower(),
+            "size_bytes": src.stat().st_size,
+        },
+        "requested_audio_track": task.audio_track,
+        "audio_track": None,
+        "separation": None,
+        "diarization": None,
+        "transcription": None,
+        "mask_erase": None,
+        "erase": None,
+        "output": None,
+        "state": "running",
+        "error": None,
+        "stages": [
+            {
+                "id": s.id,
+                "name": s.name,
+                "status": StageStatus.PENDING.value,
+                "artifacts": [],
+                "outputs": {},
+            }
+            for s in task.stages
+        ],
+    }
+
+
+def _resume_manifest(task, ws: Path, src: Path) -> dict:
+    """接续工作区清单：同一份分析则采纳已完成阶段，否则新起一份。
+
+    清单不可用（首次处理、换了音轨、源视频变了、工作区被删）时把任务的
+    全部阶段复位：任务内存里可能还记着上一轮的"已完成"，而产物已经不在了。
+    """
+    manifest = workspace.read_manifest(ws)
+    if workspace.is_for_source(manifest, task.video_path, task.audio_track):
+        _adopt_chain(
+            task, manifest, workspace.ANALYSIS_STAGES,
+            workspace.done_stages(ws, manifest),
+        )
+        if not workspace.analysis_reusable(ws, manifest):
+            # 分析链断过：旧分析合成的擦除混音不再对应，一并作废
+            _reset_stages(task, manifest, ("mask_erase", "encode_mux"))
+        manifest["state"] = "running"
+        manifest["error"] = None
+        return manifest
+    manifest = _new_manifest(task, src)
+    _reset_stages(task, manifest, [s.id for s in task.stages])
+    return manifest
+
+
+def _prepare_erase_stages(task, ws: Path, manifest: dict, targets: list[str]) -> None:
+    """擦除前的阶段采纳：目标未变的掩码合成可续用，成品总是重新封装。"""
+    done = workspace.done_stages(ws, manifest)
+    if (manifest.get("mask_erase") or {}).get("targets") != targets:
+        done.discard("mask_erase")  # 换了目标，已合成的擦除混音不再对应
+    done.discard("encode_mux")
+    _adopt_chain(task, manifest, ("mask_erase", "encode_mux"), done)
+
+
+def _adopt_chain(task, manifest: dict, stage_ids: Iterable[str], done: set[str]) -> None:
+    """按顺序采纳已完成阶段；某阶段一旦要重算，其后阶段全部作废重做。
+
+    阶段产物是链式的：说话人时段重算后，旧的样本台词与擦除混音不再描述
+    同一份分析，留着只会被静默复用出错——宁可重算。
+    """
+    adopt: list[str] = []
+    stale: list[str] = []
+    for stage_id in stage_ids:
+        if stale or stage_id not in done:
+            stale.append(stage_id)  # 断链：本阶段及其后一律重做
+        else:
+            adopt.append(stage_id)
+    _adopt_stages(task, manifest, adopt)
+    _reset_stages(task, manifest, stale)
+
+
+def _adopt_stages(task, manifest: dict, stage_ids: Iterable[str]) -> None:
+    """把工作区清单里的阶段产物采纳到任务上，跳过重算。"""
+    for stage_id in stage_ids:
+        entry = _entry(manifest, stage_id)
+        stage = _stage(task, stage_id)
+        stage.status = StageStatus.DONE
+        stage.artifacts = list(entry.get("artifacts") or [])
+        stage.outputs = dict(entry.get("outputs") or {})
+        stage.started_at = entry.get("started_at")
+        stage.finished_at = entry.get("finished_at")
+        stage.error = None
+        stage.progress = 1.0
+
+
+def _reset_stages(task, manifest: dict, stage_ids: Iterable[str]) -> None:
+    """把阶段复位为待运行（上次的产物将被重做）。"""
+    for stage_id in stage_ids:
+        stage = _stage(task, stage_id)
         stage.status = StageStatus.PENDING
         stage.started_at = None
         stage.finished_at = None
@@ -179,8 +257,7 @@ def _reset_erase_stages(task, manifest: dict) -> None:
         stage.progress = None
         stage.artifacts = []
         stage.outputs = {}
-        entry = next(m for m in manifest["stages"] if m["id"] == stage_id)
-        entry.update(
+        _entry(manifest, stage_id).update(
             status=StageStatus.PENDING.value,
             started_at=None,
             finished_at=None,
@@ -191,6 +268,9 @@ def _reset_erase_stages(task, manifest: dict) -> None:
 
 
 def _stage_audio_extract(task, ctx: RunContext, ws: Path, manifest: dict) -> Path:
+    stage = _stage(task, "audio_extract")
+    if stage.status == StageStatus.DONE:
+        return ws / stage.artifacts[0]  # 复用工作区里的降混 wav
     stage = _begin_stage(task, manifest, "audio_extract")
     src = Path(task.video_path)
     info = ffprobe_json(src)
@@ -238,6 +318,13 @@ def _stage_audio_extract(task, ctx: RunContext, ws: Path, manifest: dict) -> Pat
 def _stage_separate(
     task, ctx: RunContext, ws: Path, manifest: dict, wav: Path
 ) -> SeparationStems:
+    stage = _stage(task, "separate")
+    if stage.status == StageStatus.DONE:
+        # 复用工作区里的人声轨/伴奏轨：分离是最昂贵的 ML 阶段
+        return SeparationStems(
+            vocal=ws / stage.outputs["vocal"],
+            accompaniment=ws / stage.outputs["accompaniment"],
+        )
     stage = _begin_stage(task, manifest, "separate")
     out_dir = ws / "02-separate"
     out_dir.mkdir(exist_ok=True)
@@ -277,6 +364,9 @@ def _stage_separate(
 def _stage_diarize(
     task, ctx: RunContext, ws: Path, manifest: dict, wav: Path
 ) -> DiarizationResult:
+    stage = _stage(task, "diarize")
+    if stage.status == StageStatus.DONE:
+        return _load_diarization(ws)  # 复用工作区里的说话人时段产物
     stage = _begin_stage(task, manifest, "diarize")
     out_dir = ws / DIARIZATION_DIR
     out_dir.mkdir(exist_ok=True)
@@ -332,6 +422,8 @@ def _stage_transcribe(
     wav: Path,
     diarization: DiarizationResult,
 ) -> None:
+    if _stage(task, "transcribe").status == StageStatus.DONE:
+        return  # 复用工作区里的样本台词产物
     stage = _begin_stage(task, manifest, "transcribe")
     out_dir = ws / TRANSCRIBE_DIR
     out_dir.mkdir(exist_ok=True)
@@ -395,6 +487,16 @@ def _read_diarization_segments(ws: Path) -> list[dict]:
     return list(data.get("segments", []))
 
 
+def _load_diarization(ws: Path) -> DiarizationResult:
+    """把工作区里的说话人时段产物读回结构化结果（复用/续跑用）。"""
+    return DiarizationResult(
+        segments=tuple(
+            SpeakerSegment(str(s["speaker"]), float(s["start"]), float(s["end"]))
+            for s in _read_diarization_segments(ws)
+        )
+    )
+
+
 def union_intervals(intervals: Iterable[tuple[float, float]]) -> list[tuple[float, float]]:
     """时间区间并集（纯函数）：排序后合并重叠与相接的区间。"""
     merged: list[list[float]] = []
@@ -444,6 +546,9 @@ def erased_output_path(
 def _stage_mask_erase(
     task, ctx: RunContext, ws: Path, manifest: dict, targets: list[str]
 ) -> Path:
+    stage = _stage(task, "mask_erase")
+    if stage.status == StageStatus.DONE:
+        return ws / stage.outputs["erased_mix"]  # 目标未变，复用已合成的擦除混音
     stage = _begin_stage(task, manifest, "mask_erase")
     separation = manifest.get("separation") or {}
     if not separation.get("vocal") or not separation.get("accompaniment"):
@@ -535,12 +640,25 @@ def _stage_encode_mux(
     _end_stage(task, manifest, stage, StageStatus.DONE)
 
 
+def _stage(task, stage_id: str):
+    return next(s for s in task.stages if s.id == stage_id)
+
+
+def _entry(manifest: dict, stage_id: str) -> dict:
+    return next(m for m in manifest["stages"] if m["id"] == stage_id)
+
+
 def _begin_stage(task, manifest: dict, stage_id: str):
     _check_cancelled(task.cancel_event)
-    stage = next(s for s in task.stages if s.id == stage_id)
-    entry = next(m for m in manifest["stages"] if m["id"] == stage_id)
+    stage = _stage(task, stage_id)
     stage.status = StageStatus.RUNNING
     stage.started_at = now_iso()
+    stage.finished_at = None
+    stage.error = None  # 重跑的阶段不背着上次失败/取消的原因
+    stage.progress = None
+    stage.artifacts = []  # 产物重新登记，续跑不留重复条目
+    stage.outputs = {}
+    entry = _entry(manifest, stage_id)
     entry["status"] = stage.status.value
     entry["started_at"] = stage.started_at
     workspace.write_manifest(Path(task.workspace_dir), manifest)
@@ -554,7 +672,7 @@ def _end_stage(task, manifest: dict, stage, status: StageStatus) -> None:
 
 
 def _sync_stage_entry(task, manifest: dict, stage) -> dict:
-    entry = next(m for m in manifest["stages"] if m["id"] == stage.id)
+    entry = _entry(manifest, stage.id)
     entry["status"] = stage.status.value
     entry["finished_at"] = stage.finished_at
     entry["error"] = stage.error

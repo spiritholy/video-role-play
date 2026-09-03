@@ -1,5 +1,5 @@
-"""FastAPI 应用：任务 API + 音轨探测 + 阶段产物/说话人时段试听 + 说话人命名
-+ 服务已构建前端。"""
+"""FastAPI 应用：任务 API（提交/取消/续跑/擦除）+ 音轨探测 + 阶段产物与
+说话人时段试听 + 说话人命名 + 工作区列表与手动删除 + 服务已构建前端。"""
 
 from __future__ import annotations
 
@@ -17,7 +17,12 @@ from pydantic import BaseModel, Field
 
 from . import workspace
 from .inference import Inference
-from .manager import TaskManager, TaskNotCancellable, TaskNotErasable
+from .manager import (
+    TaskManager,
+    TaskNotCancellable,
+    TaskNotErasable,
+    TaskNotResumable,
+)
 from .media import TaskError, audio_tracks, ffprobe_json, run_ffmpeg_bytes
 from .models import TaskState, snapshot
 
@@ -117,6 +122,22 @@ def create_app(
             raise HTTPException(status_code=409, detail="任务已结束，无法取消")
         return snapshot(task)
 
+    @app.post("/api/tasks/{task_id}/resume")
+    def resume_task(task_id: str):
+        """续跑失败/已取消的任务：跳过工作区里已完成的阶段，从断点继续。
+
+        已完成阶段的产物仍在工作区，数小时的分离与说话人分离不重算。
+        """
+        try:
+            task = manager.resume(task_id)
+        except KeyError:
+            raise HTTPException(status_code=404, detail="任务不存在")
+        except TaskNotResumable:
+            raise HTTPException(
+                status_code=409, detail="任务当前状态不可续跑（只有失败或已取消的任务有断点）"
+            )
+        return snapshot(task)
+
     @app.post("/api/tasks/{task_id}/erase")
     def erase_task(task_id: str, body: EraseIn):
         """发起擦除：多选目标说话人，可选指定输出目录（默认源视频同目录）。
@@ -149,6 +170,52 @@ def create_app(
         except TaskNotErasable:
             raise HTTPException(status_code=409, detail="任务当前状态不可擦除")
         return snapshot(task)
+
+    @app.get("/api/workspaces")
+    def get_workspaces():
+        """工作区列表：磁盘占用与可复用性，供用户决定删哪个释放空间。
+
+        reusable 表示四个分析阶段产物齐全——同源新任务可直接复用，删掉
+        就意味着下次要重跑数小时的分析。busy 表示正被排队/运行中任务使用。
+        """
+        items = []
+        for ws in workspace.list_workspaces(root):
+            manifest = workspace.read_manifest(ws)
+            size = workspace.size_bytes(ws)
+            items.append(
+                {
+                    "name": ws.name,
+                    "path": str(ws),
+                    "source_path": workspace.source_path(manifest),
+                    "size_bytes": size,
+                    "size_label": workspace.format_bytes(size),
+                    "reusable": workspace.analysis_reusable(ws, manifest),
+                    "busy": manager.workspace_busy(str(ws)),
+                }
+            )
+        total = sum(w["size_bytes"] for w in items)
+        return {
+            "workspaces": items,
+            "total_bytes": total,
+            "total_label": workspace.format_bytes(total),
+        }
+
+    @app.delete("/api/workspaces/{name}")
+    def delete_workspace(name: str):
+        """手动删除工作区释放磁盘；只影响该源视频的工作区。"""
+        try:
+            ws = workspace.resolve(root, name)
+        except workspace.WorkspaceNotFound:
+            raise HTTPException(status_code=404, detail="工作区不存在")
+        if manager.workspace_busy(str(ws)):
+            raise HTTPException(
+                status_code=409, detail="工作区正在被任务使用，无法删除"
+            )
+        try:
+            workspace.delete(ws)
+        except OSError as e:
+            raise HTTPException(status_code=500, detail=f"删除工作区失败: {e}")
+        return {"deleted": ws.name, "path": str(ws)}
 
     @app.post("/api/probe")
     def probe_video(body: ProbeIn):

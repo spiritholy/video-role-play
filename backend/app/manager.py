@@ -1,4 +1,4 @@
-"""任务管理器：单实例运行 + FIFO 排队 + 运行中/排队中可取消。"""
+"""任务管理器：单实例运行 + FIFO 排队 + 运行中/排队中可取消 + 终态可续跑。"""
 
 from __future__ import annotations
 
@@ -24,6 +24,10 @@ class TaskNotCancellable(Exception):
 
 class TaskNotErasable(Exception):
     """任务当前状态不可发起擦除（需要已完成说话人分析）。"""
+
+
+class TaskNotResumable(Exception):
+    """任务当前状态没有断点可续（只有失败/已取消的任务可续跑）。"""
 
 
 class TaskManager:
@@ -105,13 +109,45 @@ class TaskManager:
                 "speakers": sorted(set(speakers)),  # 目标是说话人集合
                 "output_dir": output_dir,
             }
-            task.error = None
-            task.finished_at = None
-            task.cancel_event.clear()
-            task.state = TaskState.QUEUED
-            self._queue.append(task.id)
+            self._requeue(task)
         self._wake.set()
         return task
+
+    def resume(self, task_id: str) -> Task:
+        """续跑失败/已取消的任务：重新排队，管线按工作区清单跳过已完成阶段。
+
+        已发起过的擦除请求原样保留（目标说话人与输出目录不变），因此擦除
+        中途失败/取消的任务续跑的是擦除，而不是回到分析。
+        """
+        with self._lock:
+            task = self._tasks.get(task_id)
+            if task is None:
+                raise KeyError(task_id)
+            if task.state not in (TaskState.FAILED, TaskState.CANCELLED):
+                raise TaskNotResumable(task.state.value)
+            self._requeue(task)
+        self._wake.set()
+        return task
+
+    def _requeue(self, task: Task) -> None:
+        """终态任务重新排队（调用方持锁）：不带上一轮的失败/取消痕迹。"""
+        task.error = None
+        task.finished_at = None
+        task.cancel_event.clear()
+        task.state = TaskState.QUEUED
+        self._queue.append(task.id)
+
+    def workspace_busy(self, workspace_dir: str) -> bool:
+        """该工作区是否正被排队中/运行中的任务使用。
+
+        删除工作区前的占用检查：删掉正在写的工作区会把任务掏空。
+        """
+        with self._lock:
+            return any(
+                task.workspace_dir == workspace_dir
+                and task.state in (TaskState.QUEUED, TaskState.RUNNING)
+                for task in self._tasks.values()
+            )
 
     def _worker(self) -> None:
         while not self._stop.is_set():
