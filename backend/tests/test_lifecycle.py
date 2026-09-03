@@ -23,5 +23,6 @@ def test_提交源视频创建任务并运行到完成(client, tmp_path):
     stages = {s["id"]: s["status"] for s in done["stages"]}
     assert stages == {
         "audio_extract": "done",
+        "separate": "done",
         "encode_mux": "done",
     }

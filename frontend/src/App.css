@@ -219,3 +219,28 @@ button.cancel {
   color: #6b7075;
   text-decoration: line-through;
 }
+
+.stems {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.stem {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.stem-label {
+  font-size: 13px;
+  color: #4b5ffe;
+  font-weight: 600;
+  flex: none;
+  width: 52px;
+}
+
+.stem audio {
+  flex: 1;
+  height: 36px;
+}

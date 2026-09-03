@@ -1,7 +1,7 @@
-"""处理任务管线：音轨提取/降混 → 编码封装基线。
+"""处理任务管线：音轨提取/降混 → 人声/伴奏分离 → 编码封装基线。
 
-骨架闭环（tracer bullet），暂不含分离/擦除阶段；工作区阶段清单为后续
-断点续跑与复用提供结构。
+分离经统一 ML 推理接口（inference.Inference）调用，生产为 Demucs、
+测试注入 canned stems；工作区阶段清单为后续断点续跑与复用提供结构。
 """
 
 from __future__ import annotations
@@ -12,6 +12,7 @@ from pathlib import Path
 import threading
 
 from . import workspace
+from .inference import Inference, SeparationStems
 from .media import TaskCancelled, TaskError, audio_tracks, ffprobe_json, run_ffmpeg
 from .models import StageStatus, now_iso
 
@@ -28,6 +29,7 @@ PCM_SAMPLE_RATE = 48000
 class RunContext:
     workspace_root: Path
     cancel_event: threading.Event
+    inference: Inference
 
 
 def execute(task, ctx: RunContext) -> None:
@@ -40,6 +42,7 @@ def execute(task, ctx: RunContext) -> None:
         "source": {"path": str(src), "container": src.suffix.lower()},
         "requested_audio_track": task.audio_track,
         "audio_track": None,
+        "separation": None,
         "output": None,
         "state": "running",
         "error": None,
@@ -49,6 +52,7 @@ def execute(task, ctx: RunContext) -> None:
                 "name": s.name,
                 "status": StageStatus.PENDING.value,
                 "artifacts": [],
+                "outputs": {},
             }
             for s in task.stages
         ],
@@ -56,6 +60,7 @@ def execute(task, ctx: RunContext) -> None:
     _check_cancelled(ctx.cancel_event)
     try:
         wav = _stage_audio_extract(task, ctx, ws, manifest)
+        _stage_separate(task, ctx, ws, manifest, wav)
         _stage_encode_mux(task, ctx, ws, manifest, src, wav)
         manifest["state"] = "completed"
     except TaskCancelled:
@@ -123,6 +128,45 @@ def _stage_audio_extract(task, ctx: RunContext, ws: Path, manifest: dict) -> Pat
     return ws / artifact
 
 
+def _stage_separate(
+    task, ctx: RunContext, ws: Path, manifest: dict, wav: Path
+) -> SeparationStems:
+    stage = _begin_stage(task, manifest, "separate")
+    out_dir = ws / "02-separate"
+    out_dir.mkdir(exist_ok=True)
+
+    def on_progress(fraction: float) -> None:
+        # 分离是 CPU 上最耗时的阶段之一：进度实时可见，取消经此注入
+        stage.progress = max(0.0, min(1.0, float(fraction)))
+        _check_cancelled(ctx.cancel_event)
+
+    try:
+        stems = ctx.inference.separator.separate(wav, out_dir, on_progress)
+    except (TaskCancelled, TaskError):
+        raise
+    except Exception as e:
+        raise TaskError(f"人声/伴奏分离失败: {e}") from e
+
+    vocal = Path(stems.vocal)
+    accomp = Path(stems.accompaniment)
+    missing = [p for p in (vocal, accomp) if not p.is_file()]
+    if missing:
+        raise TaskError(f"分离结果缺少产物: {', '.join(str(p.name) for p in missing)}")
+    stage.artifacts = [str(vocal.relative_to(ws)), str(accomp.relative_to(ws))]
+    stage.outputs = {
+        "vocal": stage.artifacts[0],
+        "accompaniment": stage.artifacts[1],
+    }
+    stage.progress = 1.0
+    manifest["separation"] = {
+        "model": ctx.inference.separator.name,
+        "vocal": stage.outputs["vocal"],
+        "accompaniment": stage.outputs["accompaniment"],
+    }
+    _end_stage(task, manifest, stage, StageStatus.DONE)
+    return stems
+
+
 def _stage_encode_mux(
     task, ctx: RunContext, ws: Path, manifest: dict, src: Path, wav: Path
 ) -> None:
@@ -181,6 +225,7 @@ def _sync_stage_entry(task, manifest: dict, stage) -> dict:
     entry["finished_at"] = stage.finished_at
     entry["error"] = stage.error
     entry["artifacts"] = list(stage.artifacts)
+    entry["outputs"] = dict(stage.outputs)
     workspace.write_manifest(Path(task.workspace_dir), manifest)
     return entry
 

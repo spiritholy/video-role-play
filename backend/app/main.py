@@ -1,16 +1,19 @@
-"""FastAPI 应用：任务 API + 音轨探测 + 服务已构建前端。"""
+"""FastAPI 应用：任务 API + 音轨探测 + 阶段产物试听 + 服务已构建前端。"""
 
 from __future__ import annotations
 
+import mimetypes
 import os
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Callable
 
 from fastapi import FastAPI, HTTPException
+from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
+from .inference import Inference
 from .manager import TaskManager, TaskNotCancellable
 from .media import TaskError, audio_tracks, ffprobe_json
 from .models import snapshot
@@ -32,11 +35,12 @@ class ProbeIn(BaseModel):
 def create_app(
     workspace_root: Path | None = None,
     on_start: Callable[[], None] | None = None,
+    inference: Inference | None = None,
 ) -> FastAPI:
     root = workspace_root or Path(
         os.environ.get("VRP_WORKSPACE_ROOT", DEFAULT_WORKSPACE_ROOT)
     )
-    manager = TaskManager(root)
+    manager = TaskManager(root, inference=inference)
 
     @asynccontextmanager
     async def lifespan(_app: FastAPI):
@@ -99,6 +103,21 @@ def create_app(
             "duration": float(info.get("format", {}).get("duration") or 0),
             "tracks": tracks,
         }
+
+    @app.get("/api/tasks/{task_id}/audio/{artifact_path:path}")
+    def listen_artifact(task_id: str, artifact_path: str):
+        """试听任务阶段产物（人声轨/伴奏轨）；仅允许阶段清单登记过的产物。"""
+        task = manager.get(task_id)
+        if task is None or task.workspace_dir is None:
+            raise HTTPException(status_code=404, detail="任务不存在")
+        allowed = {a for s in task.stages for a in s.artifacts}
+        if artifact_path not in allowed:
+            raise HTTPException(status_code=404, detail="产物不存在或不可试听")
+        path = Path(task.workspace_dir) / artifact_path
+        if not path.is_file():
+            raise HTTPException(status_code=404, detail="产物文件缺失")
+        media_type = mimetypes.guess_type(path.name)[0] or "application/octet-stream"
+        return FileResponse(path, media_type=media_type)
 
     if FRONTEND_DIST.is_dir():
         app.mount(

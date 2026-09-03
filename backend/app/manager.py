@@ -8,6 +8,7 @@ from collections import deque
 from pathlib import Path
 
 from . import pipeline
+from .inference import DemucsSeparator, Inference
 from .models import Task, TaskState, now_iso
 from .pipeline import RunContext
 
@@ -17,8 +18,9 @@ class TaskNotCancellable(Exception):
 
 
 class TaskManager:
-    def __init__(self, workspace_root: Path):
+    def __init__(self, workspace_root: Path, inference: Inference | None = None):
         self._workspace_root = Path(workspace_root)
+        self._inference = inference or Inference(separator=DemucsSeparator())
         self._tasks: dict[str, Task] = {}
         self._queue: deque[str] = deque()
         self._lock = threading.RLock()
@@ -106,6 +108,7 @@ class TaskManager:
                 RunContext(
                     workspace_root=self._workspace_root,
                     cancel_event=task.cancel_event,
+                    inference=self._inference,
                 ),
             )
             self._finalize(task, TaskState.COMPLETED)

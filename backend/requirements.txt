@@ -1,5 +1,12 @@
+--extra-index-url https://download.pytorch.org/whl/cpu
 fastapi==0.115.6
 uvicorn==0.34.0
 pydantic==2.10.5
 httpx==0.28.1
 pytest==8.3.4
+# ML 推理（CPU-only；demucs 首次使用自动从公开地址下载权重）
+torch==2.4.1+cpu
+torchaudio==2.4.1+cpu
+demucs==4.1.0
+# demucs 4.1.0 运行必需但未声明；<2 兼容 torch 2.4.1
+numpy==1.26.4

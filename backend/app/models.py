@@ -28,9 +28,10 @@ STATE_LABELS = {
     TaskState.CANCELLED: "已取消",
 }
 
-# 处理任务的两个阶段（骨架闭环，暂不含擦除相关阶段）
+# 处理任务阶段（骨架闭环：提取→分离→封装；后续 issue 插入擦除相关阶段）
 STAGE_DEFS = [
     ("audio_extract", "音轨提取/降混"),
+    ("separate", "人声/伴奏分离"),
     ("encode_mux", "编码封装基线"),
 ]
 
@@ -56,6 +57,10 @@ class StageState:
     finished_at: str | None = None
     error: str | None = None
     artifacts: list[str] = field(default_factory=list)
+    # 阶段内进度 0..1（如分离阶段的段级进度）；无细粒度进度时为 None
+    progress: float | None = None
+    # 命名产物：角色 → 工作区相对路径（如 separate: vocal/accompaniment）
+    outputs: dict[str, str] = field(default_factory=dict)
 
 
 @dataclass
@@ -96,6 +101,8 @@ def snapshot(task: Task) -> dict:
                 "finished_at": s.finished_at,
                 "error": s.error,
                 "artifacts": list(s.artifacts),
+                "progress": s.progress,
+                "outputs": dict(s.outputs),
             }
             for s in task.stages
         ],

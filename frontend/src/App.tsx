@@ -6,7 +6,14 @@ interface Stage {
   status: "pending" | "running" | "done" | "failed" | "cancelled";
   error: string | null;
   artifacts: string[];
+  progress: number | null;
+  outputs: Record<string, string>;
 }
+
+const STEM_LABELS: Record<string, string> = {
+  vocal: "人声轨",
+  accompaniment: "伴奏轨",
+};
 
 interface Task {
   id: string;
@@ -56,6 +63,12 @@ function stageSummary(task: Task): string {
   );
   if (firstUndone >= 0) return `阶段 ${firstUndone + 1}/${task.stages.length} · ${task.stages[firstUndone].name}`;
   return "";
+}
+
+function audioUrl(taskId: string, artifact: string): string {
+  return `/api/tasks/${taskId}/audio/${
+    artifact.split("/").map(encodeURIComponent).join("/")
+  }`;
 }
 
 export default function App() {
@@ -214,10 +227,29 @@ export default function App() {
                   {t.stages.map((s) => (
                     <span key={s.id} className={`chip chip-${s.status}`}>
                       {s.name}
+                      {s.status === "running" && s.progress != null &&
+                        ` ${Math.round(s.progress * 100)}%`}
                     </span>
                   ))}
                 </span>
               </div>
+              {t.stages.filter((s) => s.status === "done" && Object.keys(s.outputs).length > 0)
+                .map((s) => (
+                  <div key={s.id} className="stems">
+                    {Object.entries(s.outputs).map(([role, artifact]) => (
+                      <div key={role} className="stem">
+                        <span className="stem-label">
+                          {STEM_LABELS[role] ?? role}
+                        </span>
+                        <audio
+                          controls
+                          preload="none"
+                          src={audioUrl(t.id, artifact)}
+                        />
+                      </div>
+                    ))}
+                  </div>
+                ))}
               {t.error && <p className="error-text">失败原因：{t.error}</p>}
               {t.output_path && (
                 <p className="output-text">成品：{t.output_path}</p>

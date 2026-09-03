@@ -1,15 +1,27 @@
-"""共享 fixture：真实 ffmpeg 合成秒级视频 + 走 HTTP API 的测试客户端。"""
+"""共享 fixture：真实 ffmpeg 合成秒级视频 + 走 HTTP API 的测试客户端。
+
+ML 推理走全项目唯一注入边界：默认 client 注入 CannedSeparator（canned
+stems），真实模型与权重下载永不进入测试回路。
+"""
 
 import json
 import shutil
 import struct
 import subprocess
+import threading
 import time
+from contextlib import contextmanager
 from pathlib import Path
 
 import pytest
 from fastapi.testclient import TestClient
 
+from app.inference import (
+    ACCOMPANIMENT_FILENAME,
+    VOCALS_FILENAME,
+    Inference,
+    SeparationStems,
+)
 from app.main import create_app
 
 FFMPEG = shutil.which("ffmpeg")
@@ -93,9 +105,49 @@ def wait_for(condition, timeout: float = 30.0, interval: float = 0.05) -> None:
 
 @pytest.fixture()
 def client(tmp_path: Path) -> TestClient:
-    app = create_app(workspace_root=tmp_path / "workspaces")
+    with make_client(tmp_path) as c:
+        yield c
+
+
+@contextmanager
+def make_client(tmp_path: Path, separator=None):
+    """按需注入自定义 separator（不传时用默认 canned）的测试客户端工厂。"""
+    app = create_app(
+        workspace_root=tmp_path / "workspaces",
+        inference=Inference(separator=separator or CannedSeparator()),
+    )
     with TestClient(app) as c:
         yield c
+
+
+class CannedSeparator:
+    """注入边界的替身：用 ffmpeg 高/低通生成可区分的人声/伴奏 wav。
+
+    fail 时抛出的异常模拟真实模型加载/推理失败；gate 用于把分离器
+    停驻在进度回调处，确定性观察进度与取消。
+    """
+
+    name = "canned-highpass"
+
+    def __init__(self, fail: Exception | None = None, gate: threading.Event | None = None):
+        self.fail = fail
+        self.gate = gate
+        self.calls: list[Path] = []
+
+    def separate(self, wav: Path, out_dir: Path, on_progress) -> SeparationStems:
+        self.calls.append(Path(wav))
+        if self.fail is not None:
+            raise self.fail
+        out_dir.mkdir(parents=True, exist_ok=True)
+        vocal = out_dir / VOCALS_FILENAME
+        accomp = out_dir / ACCOMPANIMENT_FILENAME
+        run_ffmpeg(["-i", str(wav), "-af", "highpass=f=4000", str(vocal)])
+        run_ffmpeg(["-i", str(wav), "-af", "lowpass=f=200", str(accomp)])
+        on_progress(0.5)
+        if self.gate is not None:
+            self.gate.wait(timeout=60)
+        on_progress(1.0)
+        return SeparationStems(vocal=vocal, accompaniment=accomp)
 
 
 def submit_task(client: TestClient, video: Path, audio_track: int | None = None) -> dict:
@@ -146,3 +198,15 @@ def dominant_freq(path: Path) -> float:
     )
     duration = n / 8000
     return crossings / 2 / duration
+
+
+def mean_volume(path: Path) -> float:
+    """平均响度（dB，ffmpeg volumedetect）；越小越安静。"""
+    proc = subprocess.run(
+        [FFMPEG, "-i", str(path), "-af", "volumedetect", "-f", "null", "-"],
+        check=True, capture_output=True, text=True,
+    )
+    for line in proc.stderr.splitlines():
+        if "mean_volume:" in line:
+            return float(line.split("mean_volume:")[1].replace("dB", "").strip())
+    raise AssertionError(f"volumedetect 未输出 mean_volume: {proc.stderr[-400:]}")
