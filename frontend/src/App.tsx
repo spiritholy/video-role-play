@@ -22,6 +22,7 @@ interface TimelineSegment {
 
 interface TimelineSpeaker {
   label: string;
+  name: string | null;
   speech_time: number;
   segments: TimelineSegment[];
 }
@@ -129,9 +130,18 @@ function audioUrl(taskId: string, artifact: string): string {
   }`;
 }
 
+function workspaceKey(t: Task): string {
+  return t.workspace_dir ?? t.id;
+}
+
 export default function App() {
   const [tasks, setTasks] = useState<Task[]>([]);
   const [timelines, setTimelines] = useState<Record<string, TimelineOrError>>({});
+  // 说话人命名（工作区元数据的本地镜像）：工作区 → 编号标签 → 名字。
+  // 按工作区键控：命名是工作区级数据，同源多任务卡片共享同一份显示。
+  const [speakerNames, setSpeakerNames] = useState<
+    Record<string, Record<string, string>>
+  >({});
   const [transcripts, setTranscripts] = useState<Record<string, TranscriptsOrError>>({});
   const [playing, setPlaying] = useState<Playing | null>(null);
   const audioRef = useRef<HTMLAudioElement | null>(null);
@@ -156,8 +166,47 @@ export default function App() {
         }
         const data: Timeline = await resp.json();
         setTimelines((prev) => ({ ...prev, [t.id]: data }));
+        const wsKey = workspaceKey(t);
+        setSpeakerNames((prev) => ({
+          ...prev,
+          [wsKey]: Object.fromEntries(
+            data.speakers.filter((s) => s.name).map((s) => [s.label, s.name as string]),
+          ),
+        }));
       } catch {
         setTimelines((prev) => ({ ...prev, [t.id]: "error" }));
+      }
+    },
+    [],
+  );
+
+  const renameSpeaker = useCallback(
+    async (
+      task: Task,
+      label: string,
+      rawName: string,
+    ): Promise<string | null | undefined> => {
+      const wsKey = workspaceKey(task);
+      try {
+        const resp = await fetch(
+          `/api/tasks/${task.id}/speakers/${encodeURIComponent(label)}/name`,
+          {
+            method: "PUT",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ name: rawName }),
+          },
+        );
+        if (!resp.ok) return undefined;
+        const data: { label: string; name: string | null } = await resp.json();
+        setSpeakerNames((prev) => {
+          const forWs = { ...(prev[wsKey] ?? {}) };
+          if (data.name) forWs[label] = data.name;
+          else delete forWs[label];
+          return { ...prev, [wsKey]: forWs };
+        });
+        return data.name;
+      } catch {
+        return undefined;
       }
     },
     [],
@@ -314,10 +363,12 @@ export default function App() {
       <SpeakerTimeline
         taskId={t.id}
         timeline={timeline}
+        names={speakerNames[workspaceKey(t)] ?? {}}
         samplesBySpeaker={samplesBySpeaker}
         samplesHint={samplesHint}
         playing={playing}
         onPlay={playSegment}
+        onRename={(label, name) => renameSpeaker(t, label, name)}
       />
     );
   }
@@ -438,19 +489,24 @@ function fileName(path: string): string {
 function SpeakerTimeline({
   taskId,
   timeline,
+  names,
   samplesBySpeaker,
   samplesHint,
   playing,
   onPlay,
+  onRename,
 }: {
   taskId: string;
   timeline: Timeline;
+  names: Record<string, string>;
   samplesBySpeaker: Record<string, TranscriptSample[]>;
   samplesHint: string | null;
   playing: Playing | null;
   onPlay: (taskId: string, speaker: string, seg: TimelineSegment) => void;
+  onRename: (label: string, name: string) => Promise<string | null | undefined>;
 }) {
   const pct = (v: number) => `${((v / timeline.duration) * 100).toFixed(3)}%`;
+  const shown = (label: string) => names[label] ?? label;
   const isActive = (sp: TimelineSpeaker, seg: TimelineSegment) =>
     playing !== null &&
     playing.taskId === taskId &&
@@ -461,7 +517,7 @@ function SpeakerTimeline({
   return (
     <div className="timeline">
       <div className="timeline-title">
-        说话人时间轴（共 {timeline.num_speakers} 人，点击任意时段试听）
+        说话人时间轴（共 {timeline.num_speakers} 人，点击名字可命名，点击任意时段试听）
       </div>
       {samplesHint && <p className="timeline-hint">{samplesHint}</p>}
       {timeline.speakers.map((sp) => {
@@ -471,7 +527,11 @@ function SpeakerTimeline({
           <div key={sp.label} className="timeline-row">
             <span className="speaker-chip">
               <span className="dot" style={{ background: color }} />
-              {sp.label}
+              <SpeakerName
+                label={sp.label}
+                name={names[sp.label] ?? null}
+                onRename={onRename}
+              />
               <span className="speech-time">{fmtTime(sp.speech_time)}</span>
             </span>
             <div className="timeline-track">
@@ -485,8 +545,8 @@ function SpeakerTimeline({
                     width: pct(seg.end - seg.start),
                     background: color,
                   }}
-                  title={`${sp.label} · ${fmtTime(seg.start)} – ${fmtTime(seg.end)}`}
-                  aria-label={`试听 ${sp.label}，${fmtTime(seg.start)} 到 ${fmtTime(seg.end)}`}
+                  title={`${shown(sp.label)} · ${fmtTime(seg.start)} – ${fmtTime(seg.end)}`}
+                  aria-label={`试听 ${shown(sp.label)}，${fmtTime(seg.start)} 到 ${fmtTime(seg.end)}`}
                   onClick={() => onPlay(taskId, sp.label, seg)}
                 />
               ))}
@@ -500,7 +560,7 @@ function SpeakerTimeline({
                       key={i}
                       type="button"
                       className={`sample${isActive(sp, s) ? " playing" : ""}`}
-                      title={`试听样本 ${fmtTime(s.start)} – ${fmtTime(s.end)}`}
+                      title={`试听 ${shown(sp.label)} 的样本 ${fmtTime(s.start)} – ${fmtTime(s.end)}`}
                       onClick={() => onPlay(taskId, sp.label, s)}
                     >
                       <span className="sample-time">
@@ -529,5 +589,63 @@ function SpeakerTimeline({
         </div>
       )}
     </div>
+  );
+}
+
+function SpeakerName({
+  label,
+  name,
+  onRename,
+}: {
+  label: string;
+  name: string | null;
+  onRename: (label: string, name: string) => Promise<string | null | undefined>;
+}) {
+  const [editing, setEditing] = useState(false);
+  const [draft, setDraft] = useState("");
+  const [busy, setBusy] = useState(false);
+
+  async function commit() {
+    if (busy) return;
+    setBusy(true);
+    const final = await onRename(label, draft);
+    if (final === undefined) {
+      setBusy(false);  // 失败：保持编辑态，草稿保留供重试或 Esc 取消
+      return;
+    }
+    setDraft(final ?? "");
+    setBusy(false);
+    setEditing(false);
+  }
+
+  if (!editing) {
+    return (
+      <button
+        type="button"
+        className="speaker-name"
+        title={name ? `改名「${name}」` : `为 ${label} 命名`}
+        onClick={() => {
+          setDraft(name ?? "");
+          setEditing(true);
+        }}
+      >
+        {name ?? label}
+      </button>
+    );
+  }
+  return (
+    <input
+      className="speaker-name-input"
+      value={draft}
+      autoFocus
+      maxLength={100}
+      placeholder={label}
+      onChange={(e) => setDraft(e.target.value)}
+      onBlur={commit}
+      onKeyDown={(e) => {
+        if (e.key === "Enter") commit();
+        else if (e.key === "Escape") setEditing(false);
+      }}
+    />
   );
 }

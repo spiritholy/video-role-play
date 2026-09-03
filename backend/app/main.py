@@ -1,4 +1,5 @@
-"""FastAPI 应用：任务 API + 音轨探测 + 阶段产物/说话人时段试听 + 服务已构建前端。"""
+"""FastAPI 应用：任务 API + 音轨探测 + 阶段产物/说话人时段试听 + 说话人命名
++ 服务已构建前端。"""
 
 from __future__ import annotations
 
@@ -14,6 +15,7 @@ from fastapi.responses import FileResponse, Response
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
+from . import workspace
 from .inference import Inference
 from .manager import TaskManager, TaskNotCancellable
 from .media import TaskError, audio_tracks, ffprobe_json, run_ffmpeg_bytes
@@ -38,6 +40,30 @@ class TaskSubmitIn(BaseModel):
 
 class ProbeIn(BaseModel):
     video_path: str = Field(min_length=1)
+
+
+class SpeakerNameIn(BaseModel):
+    name: str = Field(max_length=100)
+
+
+def _require_task(manager: TaskManager, task_id: str):
+    task = manager.get(task_id)
+    if task is None or task.workspace_dir is None:
+        raise HTTPException(status_code=404, detail="任务不存在")
+    return task
+
+
+def _load_diarization(task) -> dict:
+    """读取说话人时段产物；阶段未完成或产物缺失时按 404 拒绝。"""
+    stage = _stage_of(task, "diarize")
+    artifact = stage.outputs.get("diarization") if stage else None
+    if artifact is None:
+        raise HTTPException(status_code=404, detail="说话人分离尚未完成")
+    path = Path(task.workspace_dir) / artifact
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        raise HTTPException(status_code=404, detail="说话人分离产物缺失")
 
 
 def create_app(
@@ -114,19 +140,12 @@ def create_app(
 
     @app.get("/api/tasks/{task_id}/diarization")
     def get_diarization(task_id: str):
-        """说话人时间轴数据：按说话人分组的时段（纵览全片谁在何时说话）。"""
-        task = manager.get(task_id)
-        if task is None or task.workspace_dir is None:
-            raise HTTPException(status_code=404, detail="任务不存在")
-        stage = _stage_of(task, "diarize")
-        artifact = stage.outputs.get("diarization") if stage else None
-        if artifact is None:
-            raise HTTPException(status_code=404, detail="说话人分离尚未完成")
-        path = Path(task.workspace_dir) / artifact
-        try:
-            data = json.loads(path.read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError):
-            raise HTTPException(status_code=404, detail="说话人分离产物缺失")
+        """说话人时间轴数据：按说话人分组的时段（纵览全片谁在何时说话）。
+
+        每个说话人附带工作区元数据中的命名（未命名为 null，界面回退编号标签）。
+        """
+        task = _require_task(manager, task_id)
+        data = _load_diarization(task)
         turns = [
             (s["speaker"], float(s["start"]), float(s["end"]))
             for s in data.get("segments", [])
@@ -139,12 +158,33 @@ def create_app(
             )
             sp["speech_time"] += end - start
             sp["segments"].append({"start": start, "end": end})
+        names = workspace.read_speaker_names(Path(task.workspace_dir))
         return {
             "model": data.get("model"),
             "num_speakers": data.get("num_speakers", len(speakers)),
             "duration": max((e for _, _, e in turns), default=0.0),
-            "speakers": [speakers[k] for k in sorted(speakers)],
+            "speakers": [
+                {**speakers[k], "name": names.get(k)} for k in sorted(speakers)
+            ],
         }
+
+    @app.put("/api/tasks/{task_id}/speakers/{label}/name")
+    def rename_speaker(task_id: str, label: str, body: SpeakerNameIn):
+        """命名/改名/清除：写入工作区元数据，随工作区存续，不强制唯一。"""
+        task = _require_task(manager, task_id)
+        data = _load_diarization(task)
+        known = {s["speaker"] for s in data.get("segments", [])}
+        if label not in known:
+            raise HTTPException(status_code=404, detail="说话人不存在")
+        name = body.name.strip()
+        ws = Path(task.workspace_dir)
+        names = workspace.read_speaker_names(ws)
+        if name:
+            names[label] = name
+        else:
+            names.pop(label, None)  # 空白名字 = 清除命名，界面回退编号标签
+        workspace.write_speaker_names(ws, names)
+        return {"label": label, "name": name or None}
 
     @app.get("/api/tasks/{task_id}/transcripts")
     def get_transcripts(task_id: str):

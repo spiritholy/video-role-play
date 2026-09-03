@@ -294,6 +294,34 @@ button.cancel {
   font-size: 12px;
 }
 
+.speaker-name {
+  max-width: 140px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  padding: 0 2px;
+  border: none;
+  background: none;
+  font-family: inherit;
+  font-size: 13px;
+  color: #1f2329;
+  cursor: text;
+}
+
+.speaker-name:hover:not(:disabled) {
+  color: #4b5ffe;
+  text-decoration: underline dotted;
+}
+
+.speaker-name-input {
+  width: 110px;
+  padding: 1px 6px;
+  border: 1px solid #4b5ffe;
+  border-radius: 4px;
+  font-family: inherit;
+  font-size: 13px;
+}
+
 .timeline-track {
   position: relative;
   height: 20px;
