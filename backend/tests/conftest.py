@@ -224,6 +224,59 @@ class CannedSeparator:
         return SeparationStems(vocal=vocal, accompaniment=accomp)
 
 
+class NoiseStemsSeparator:
+    """粉噪声 stems 替身：人声/伴奏各一路独立粉噪声。
+
+    高熵内容让 AAC 编码器吃满目标码率，供成品码率断言使用（正弦类
+    canned 内容编码码率天然低于目标）。
+    """
+
+    name = "canned-noise"
+
+    def separate(self, wav: Path, out_dir: Path, on_progress) -> SeparationStems:
+        duration = 2
+        out_dir.mkdir(parents=True, exist_ok=True)
+        vocal = out_dir / VOCALS_FILENAME
+        accomp = out_dir / ACCOMPANIMENT_FILENAME
+        for path, seed in ((vocal, 1), (accomp, 2)):
+            run_ffmpeg([
+                "-f", "lavfi", "-i", f"anoisesrc=color=pink:duration={duration}:seed={seed}",
+                "-ar", "48000", "-ac", "2", str(path),
+            ])
+        on_progress(1.0)
+        return SeparationStems(vocal=vocal, accompaniment=accomp)
+
+
+class ToneStemsSeparator:
+    """固定音调 stems 替身：人声轨/伴奏轨分别为 3000Hz / 200Hz 全程正弦。
+
+    人声与伴奏内容可区分（分段主频率与分频能量可测量），供掩码语义断言；
+    振幅压到 0.4，避免混音求和削波改变波形。
+    """
+
+    name = "canned-tones"
+    VOCAL_HZ = 3000
+    ACCOMP_HZ = 200
+
+    def __init__(self, duration: float = 4.0):
+        self.duration = duration
+
+    def separate(self, wav: Path, out_dir: Path, on_progress) -> SeparationStems:
+        out_dir.mkdir(parents=True, exist_ok=True)
+        vocal = out_dir / VOCALS_FILENAME
+        accomp = out_dir / ACCOMPANIMENT_FILENAME
+        run_ffmpeg([
+            "-f", "lavfi", "-i", f"sine=frequency={self.VOCAL_HZ}:duration={self.duration}",
+            "-af", "volume=0.4", "-ar", "48000", str(vocal),
+        ])
+        run_ffmpeg([
+            "-f", "lavfi", "-i", f"sine=frequency={self.ACCOMP_HZ}:duration={self.duration}",
+            "-af", "volume=0.4", "-ar", "48000", str(accomp),
+        ])
+        on_progress(1.0)
+        return SeparationStems(vocal=vocal, accompaniment=accomp)
+
+
 def submit_task(client: TestClient, video: Path, audio_track: int | None = None) -> dict:
     body = {"video_path": str(video)}
     if audio_track is not None:
@@ -231,6 +284,43 @@ def submit_task(client: TestClient, video: Path, audio_track: int | None = None)
     resp = client.post("/api/tasks", json=body)
     assert resp.status_code == 200, resp.text
     return resp.json()
+
+
+def erase(client: TestClient, task_id: str, speakers: list[str],
+          output_dir: str | None = None):
+    body: dict = {"speakers": speakers}
+    if output_dir is not None:
+        body["output_dir"] = output_dir
+    return client.post(f"/api/tasks/{task_id}/erase", json=body)
+
+
+def run_to_analysis(client: TestClient, video: Path, audio_track: int | None = None) -> dict:
+    """提交任务并等待分析阶段（音轨提取→样本转写）完成。"""
+    task = submit_task(client, video, audio_track)
+    wait_for(lambda: get_task(client, task["id"])["state"] == "completed")
+    return get_task(client, task["id"])
+
+
+def erase_to_completion(client: TestClient, task_id: str, speakers: list[str],
+                        output_dir: str | None = None) -> dict:
+    """发起擦除并等待掩码合成与编码封装完成，返回任务快照。"""
+    resp = erase(client, task_id, speakers, output_dir)
+    assert resp.status_code == 200, resp.text
+    wait_for(lambda: get_task(client, task_id)["state"] == "completed")
+    return get_task(client, task_id)
+
+
+def band_mean_volume(path: Path, start: float, end: float, prefilter: str) -> float:
+    """指定时间段经预滤波后的平均响度（dB，volumedetect）；比较频带能量用。"""
+    proc = subprocess.run(
+        [FFMPEG, "-ss", f"{start:.3f}", "-t", f"{end - start:.3f}", "-i", str(path),
+         "-af", f"{prefilter},volumedetect", "-f", "null", "-"],
+        check=True, capture_output=True, text=True,
+    )
+    for line in proc.stderr.splitlines():
+        if "mean_volume:" in line:
+            return float(line.split("mean_volume:")[1].replace("dB", "").strip())
+    raise AssertionError(f"volumedetect 未输出 mean_volume: {proc.stderr[-400:]}")
 
 
 def get_task(client: TestClient, task_id: str) -> dict:
@@ -257,11 +347,19 @@ def audio_bitrate(path: Path) -> int:
     return int(total * 8 / duration)
 
 
-def dominant_freq(path: Path) -> float:
-    """解码媒体音频为 8kHz 单声道 PCM，用零交叉估算主频率。"""
+def dominant_freq(path: Path, start: float = 0.0, end: float | None = None,
+                  rate: int = 8000) -> float:
+    """解码媒体音频为单声道 PCM，用零交叉估算主频率。
+
+    rate 需显著高于待测频率（零交叉法在接近奈奎斯特频率时失真）；
+    start/end 限定测量时间段（掩码语义按分段断言）。
+    """
+    args = ["-i", str(path)]
+    if end is not None:
+        args = ["-ss", f"{start:.3f}", "-t", f"{end - start:.3f}", *args]
     proc = subprocess.run(
-        [FFMPEG, "-v", "error", "-i", str(path), "-f", "s16le",
-         "-ac", "1", "-ar", "8000", "-"],
+        [FFMPEG, "-v", "error", *args, "-f", "s16le",
+         "-ac", "1", "-ar", str(rate), "-"],
         check=True, capture_output=True,
     )
     data = proc.stdout
@@ -270,7 +368,7 @@ def dominant_freq(path: Path) -> float:
     crossings = sum(
         1 for a, b in zip(samples, samples[1:]) if (a < 0) != (b < 0)
     )
-    duration = n / 8000
+    duration = n / rate
     return crossings / 2 / duration
 
 

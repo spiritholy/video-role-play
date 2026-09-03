@@ -2,10 +2,9 @@
 
 from conftest import (
     dominant_freq,
-    get_task,
+    erase_to_completion,
     make_video,
-    submit_task,
-    wait_for,
+    run_to_analysis,
 )
 
 
@@ -22,15 +21,15 @@ def test_探测接口列出全部音轨(client, tmp_path):
 
 def test_默认处理第一条音轨(client, tmp_path):
     video = make_video(tmp_path, "多音轨.mp4", extra_tracks=1, audio_freq=440)
-    task = submit_task(client, video)
-    wait_for(lambda: get_task(client, task["id"])["state"] == "completed")
-    freq = dominant_freq(get_task(client, task["id"])["output_path"])
+    task = run_to_analysis(client, video)
+    done = erase_to_completion(client, task["id"], ["SPEAKER_00"])
+    freq = dominant_freq(done["output_path"])
     assert 400 < freq < 480, f"成品应来自 440Hz 的第一条音轨，实测 {freq:.0f}Hz"
 
 
 def test_提交时切换音轨(client, tmp_path):
     video = make_video(tmp_path, "多音轨.mp4", extra_tracks=1, audio_freq=440)
-    task = submit_task(client, video, audio_track=1)
-    wait_for(lambda: get_task(client, task["id"])["state"] == "completed")
-    freq = dominant_freq(get_task(client, task["id"])["output_path"])
+    task = run_to_analysis(client, video, audio_track=1)
+    done = erase_to_completion(client, task["id"], ["SPEAKER_00"])
+    freq = dominant_freq(done["output_path"])
     assert 800 < freq < 960, f"成品应来自 880Hz 的第二条音轨，实测 {freq:.0f}Hz"

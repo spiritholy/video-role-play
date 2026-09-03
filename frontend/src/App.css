@@ -409,3 +409,59 @@ button.cancel {
   font-size: 13px;
   color: #1f2329;
 }
+
+.erase-form {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  padding: 10px;
+  border: 1px solid #e5e6eb;
+  border-radius: 8px;
+  background: #fafbfc;
+}
+
+.erase-title {
+  font-size: 13px;
+  color: #4b5960;
+}
+
+.erase-speakers {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px 16px;
+}
+
+.erase-speaker {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 13px;
+  cursor: pointer;
+}
+
+.erase-speaker .dot {
+  width: 10px;
+  height: 10px;
+  border-radius: 50%;
+  flex: none;
+}
+
+.erase-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.erase-row label {
+  font-size: 13px;
+  color: #4b5960;
+  flex: none;
+}
+
+.erase-row input {
+  flex: 1;
+}
+
+.erase-row button {
+  flex: none;
+}

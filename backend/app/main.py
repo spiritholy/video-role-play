@@ -17,9 +17,9 @@ from pydantic import BaseModel, Field
 
 from . import workspace
 from .inference import Inference
-from .manager import TaskManager, TaskNotCancellable
+from .manager import TaskManager, TaskNotCancellable, TaskNotErasable
 from .media import TaskError, audio_tracks, ffprobe_json, run_ffmpeg_bytes
-from .models import snapshot
+from .models import TaskState, snapshot
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_WORKSPACE_ROOT = REPO_ROOT / "workspaces"
@@ -44,6 +44,11 @@ class ProbeIn(BaseModel):
 
 class SpeakerNameIn(BaseModel):
     name: str = Field(max_length=100)
+
+
+class EraseIn(BaseModel):
+    speakers: list[str] = Field(min_length=1)
+    output_dir: str | None = None
 
 
 def _require_task(manager: TaskManager, task_id: str):
@@ -110,6 +115,39 @@ def create_app(
             raise HTTPException(status_code=404, detail="任务不存在")
         except TaskNotCancellable:
             raise HTTPException(status_code=409, detail="任务已结束，无法取消")
+        return snapshot(task)
+
+    @app.post("/api/tasks/{task_id}/erase")
+    def erase_task(task_id: str, body: EraseIn):
+        """发起擦除：多选目标说话人，可选指定输出目录（默认源视频同目录）。
+
+        任务重新排队运行掩码合成与编码封装；说话人标签须来自说话人分离
+        结果，输出目录须可创建。
+        """
+        task = _require_task(manager, task_id)
+        if task.state in (TaskState.QUEUED, TaskState.RUNNING):
+            raise HTTPException(
+                status_code=409, detail="任务正在排队或运行中，无法发起擦除"
+            )
+        data = _load_diarization(task)
+        known = {s["speaker"] for s in data.get("segments", [])}
+        unknown = sorted({s for s in body.speakers if s not in known})
+        if unknown:
+            raise HTTPException(
+                status_code=404, detail=f"说话人不存在: {', '.join(unknown)}"
+            )
+        output_dir = body.output_dir.strip() if body.output_dir else None
+        if output_dir:
+            try:
+                Path(output_dir).mkdir(parents=True, exist_ok=True)
+            except OSError as e:
+                raise HTTPException(status_code=400, detail=f"输出目录不可用: {e}")
+        try:
+            task = manager.erase(task_id, body.speakers, output_dir)
+        except KeyError:
+            raise HTTPException(status_code=404, detail="任务不存在")
+        except TaskNotErasable:
+            raise HTTPException(status_code=409, detail="任务当前状态不可擦除")
         return snapshot(task)
 
     @app.post("/api/probe")

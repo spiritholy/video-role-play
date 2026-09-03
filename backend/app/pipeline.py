@@ -1,19 +1,22 @@
-"""处理任务管线：音轨提取/降混 → 人声/伴奏分离 → 说话人分离 → 样本转写
-→ 编码封装基线。
+"""处理任务管线：分析阶段（音轨提取/降混 → 人声/伴奏分离 → 说话人分离
+→ 样本转写）与擦除阶段（掩码合成 → 编码封装）。
 
 ML 阶段经统一 ML 推理接口（inference.Inference）调用，生产为 Demucs /
-pyannote / Whisper、测试注入 canned 输出；工作区阶段清单为后续断点续跑
-与复用提供结构。
+pyannote / Whisper、测试注入 canned 输出；工作区阶段清单为断点续跑与
+复用提供结构。擦除语义按 ADR-0001：掩码 = 目标说话人时段之并集，只作用
+于人声轨，重叠时段整段擦除（目标优先），伴奏轨原样保留。
 """
 
 from __future__ import annotations
 
 import json
 import os
+import shutil
 import wave
 from dataclasses import dataclass
 from pathlib import Path
 import threading
+from typing import Iterable
 
 from . import workspace
 from .inference import DiarizationResult, Inference, SeparationStems
@@ -24,15 +27,18 @@ from .samples import select_samples
 # 官方支持 AAC 的容器；其余（如 WebM）落到 MKV
 AAC_CONTAINERS = {".mp4", ".m4v", ".mov", ".mkv"}
 _MUXER_BY_EXT = {".mp4": "mp4", ".m4v": "mp4", ".mov": "mov", ".mkv": "matroska"}
-# 成品命名：临时后缀，命名规范在擦除闭环中定稿
-OUTPUT_SUFFIX = "__baseline"
 
 PCM_SAMPLE_RATE = 48000
+
+# 磁盘预检：按源视频体积的倍数估算工作区需求（spec：约 3–5 倍，取上限保守）
+WORKSPACE_FACTOR = 5
 
 DIARIZATION_DIR = "03-diarize"
 DIARIZATION_FILENAME = "diarization.json"
 TRANSCRIBE_DIR = "04-transcribe"
 TRANSCRIPTION_FILENAME = "transcripts.json"
+MASK_ERASE_DIR = "05-mask-erase"
+ERASED_MIX_FILENAME = "erased_mix.wav"
 
 
 @dataclass
@@ -42,9 +48,41 @@ class RunContext:
     inference: Inference
 
 
-def execute(task, ctx: RunContext) -> None:
-    """运行任务的全部阶段；取消/失败时保留已完成产物并写入阶段清单。"""
+def _disk_free(path: Path) -> int:
+    """工作区所在磁盘的可用字节数（测试经 monkeypatch 注入固定余量）。"""
+    return shutil.disk_usage(path).free
+
+
+def _fmt_bytes(n: float) -> str:
+    for unit, scale in (("GB", 1e9), ("MB", 1e6), ("KB", 1e3)):
+        if n >= scale:
+            return f"{n / scale:.1f} {unit}"
+    return f"{n:.0f} B"
+
+
+def ensure_disk_space(src: Path, workspace_root: Path) -> None:
+    """任务启动前磁盘预检：按源视频体积估算工作区需求，不足立即失败。
+
+    对任务的全部阶段生效（分析与擦除启动时各执行一次）。
+    """
+    if not src.is_file():
+        raise TaskError(f"源视频路径不存在: {src}")
+    size = src.stat().st_size
+    need = size * WORKSPACE_FACTOR
+    Path(workspace_root).mkdir(parents=True, exist_ok=True)  # 预检需真实路径
+    free = _disk_free(workspace_root)
+    if free < need:
+        raise TaskError(
+            f"磁盘空间不足：任务需要约 {_fmt_bytes(need)}"
+            f"（源视频 {_fmt_bytes(size)} × {WORKSPACE_FACTOR}），"
+            f"工作区所在磁盘仅剩 {_fmt_bytes(free)}"
+        )
+
+
+def run_analysis(task, ctx: RunContext) -> None:
+    """运行分析阶段（①–④）；取消/失败时保留已完成产物并写入阶段清单。"""
     src = Path(task.video_path)
+    ensure_disk_space(src, ctx.workspace_root)
     ws = workspace.prepare(ctx.workspace_root, task.video_path)
     task.workspace_dir = str(ws)
     manifest = {
@@ -55,6 +93,7 @@ def execute(task, ctx: RunContext) -> None:
         "separation": None,
         "diarization": None,
         "transcription": None,
+        "erase": None,
         "output": None,
         "state": "running",
         "error": None,
@@ -70,12 +109,46 @@ def execute(task, ctx: RunContext) -> None:
         ],
     }
     _check_cancelled(ctx.cancel_event)
-    try:
+
+    def stages():
         wav = _stage_audio_extract(task, ctx, ws, manifest)
         _stage_separate(task, ctx, ws, manifest, wav)
         diarization = _stage_diarize(task, ctx, ws, manifest, wav)
         _stage_transcribe(task, ctx, ws, manifest, wav, diarization)
-        _stage_encode_mux(task, ctx, ws, manifest, src, wav)
+
+    _run_stages(task, manifest, stages)
+
+
+def run_erase(task, ctx: RunContext) -> None:
+    """运行擦除阶段（⑤–⑥）：读取工作区分析产物，掩码合成后编码封装。"""
+    src = Path(task.video_path)
+    ensure_disk_space(src, ctx.workspace_root)
+    ws = Path(task.workspace_dir or "")
+    manifest = workspace.read_manifest(ws) if str(ws) else None
+    if manifest is None or not manifest.get("diarization"):
+        raise TaskError("工作区缺少说话人分离产物，无法擦除")
+    erase_req = task.erase or {}
+    targets = [str(s) for s in erase_req.get("speakers", [])]
+    _reset_erase_stages(task, manifest)
+    manifest["state"] = "running"
+    manifest["error"] = None
+    _check_cancelled(ctx.cancel_event)
+
+    def stages():
+        mix = _stage_mask_erase(task, ctx, ws, manifest, targets)
+        _stage_encode_mux(task, ctx, ws, manifest, src, mix, targets)
+        manifest["erase"] = {
+            "speakers": targets,
+            "output_dir": erase_req.get("output_dir"),
+        }
+
+    _run_stages(task, manifest, stages)
+
+
+def _run_stages(task, manifest: dict, stages) -> None:
+    """运行阶段序列；取消/失败时保留已完成产物并写入阶段清单。"""
+    try:
+        stages()
         manifest["state"] = "completed"
     except TaskCancelled:
         _mark_stage_terminal(task, manifest, StageStatus.CANCELLED)
@@ -92,14 +165,34 @@ def execute(task, ctx: RunContext) -> None:
         manifest["error"] = repr(e)
         raise TaskError(f"内部错误: {e}") from e
     finally:
-        workspace.write_manifest(ws, manifest)
+        workspace.write_manifest(Path(task.workspace_dir), manifest)
+
+
+def _reset_erase_stages(task, manifest: dict) -> None:
+    """重新发起擦除时把 ⑤–⑥ 复位为待运行（上次擦除的产物将被重做）。"""
+    for stage_id in ("mask_erase", "encode_mux"):
+        stage = next(s for s in task.stages if s.id == stage_id)
+        stage.status = StageStatus.PENDING
+        stage.started_at = None
+        stage.finished_at = None
+        stage.error = None
+        stage.progress = None
+        stage.artifacts = []
+        stage.outputs = {}
+        entry = next(m for m in manifest["stages"] if m["id"] == stage_id)
+        entry.update(
+            status=StageStatus.PENDING.value,
+            started_at=None,
+            finished_at=None,
+            error=None,
+            artifacts=[],
+            outputs={},
+        )
 
 
 def _stage_audio_extract(task, ctx: RunContext, ws: Path, manifest: dict) -> Path:
     stage = _begin_stage(task, manifest, "audio_extract")
     src = Path(task.video_path)
-    if not src.is_file():
-        raise TaskError(f"源视频路径不存在: {src}")
     info = ffprobe_json(src)
     audio = audio_tracks(info)
     if not audio:
@@ -293,37 +386,152 @@ def _wav_duration(wav: Path) -> float:
         return 0.0
 
 
-def _stage_encode_mux(
-    task, ctx: RunContext, ws: Path, manifest: dict, src: Path, wav: Path
-) -> None:
-    stage = _begin_stage(task, manifest, "encode_mux")
+def _read_diarization_segments(ws: Path) -> list[dict]:
+    path = ws / DIARIZATION_DIR / DIARIZATION_FILENAME
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as e:
+        raise TaskError("说话人分离产物缺失或损坏，无法擦除") from e
+    return list(data.get("segments", []))
+
+
+def union_intervals(intervals: Iterable[tuple[float, float]]) -> list[tuple[float, float]]:
+    """时间区间并集（纯函数）：排序后合并重叠与相接的区间。"""
+    merged: list[list[float]] = []
+    for start, end in sorted(intervals):
+        if merged and start <= merged[-1][1]:
+            merged[-1][1] = max(merged[-1][1], end)
+        else:
+            merged.append([start, end])
+    return [(s, e) for s, e in merged]
+
+
+def build_mix_filter(intervals: list[tuple[float, float]]) -> str:
+    """掩码混音的 filter_complex 脚本：目标时段在人声轨整段擦除，再与伴奏求和。
+
+    amix normalize=0 保持可加信号的原始电平关系（人声+伴奏即源混音）。
+    走 filter_complex_script 文件而非命令行参数：长片说话人时段可达数千段，
+    不受单参数长度限制。
+    """
+    if intervals:
+        cond = "+".join(f"between(t,{s:.3f},{e:.3f})" for s, e in intervals)
+        head = f"[0:a]volume=volume=0:enable='{cond}'[masked];"
+        inputs = "[masked][1:a]"
+    else:
+        head = ""
+        inputs = "[0:a][1:a]"
+    return f"{head}{inputs}amix=inputs=2:duration=longest:normalize=0[mix]"
+
+
+def erased_output_path(
+    src: Path, targets: list[str], names: dict[str, str], output_dir: str | None
+) -> Path:
+    """成品路径：`<源片名>__erased-<名字或编号标签以+连接>.<原扩展名>`。
+
+    容器跟随源（源容器官方不支持 AAC 时落 MKV）；名字优先于编号标签，
+    按目标标签排序保证同请求幂等；标签段经文件名净化，名字里的 + 一并
+    转写，保证文件名中的 + 都是目标分隔符。
+    """
     ext = src.suffix.lower()
     out_ext = ext if ext in AAC_CONTAINERS else ".mkv"
-    final = src.with_name(f"{src.stem}{OUTPUT_SUFFIX}{out_ext}")
-    tmp = src.with_name(f"{src.stem}{OUTPUT_SUFFIX}{out_ext}.part-{os.getpid()}")
+    labels = "+".join(
+        workspace.sanitize_stem(names.get(t) or t) for t in sorted(targets)
+    )
+    parent = Path(output_dir) if output_dir else src.parent
+    return parent / f"{src.stem}__erased-{labels}{out_ext}"
+
+
+def _stage_mask_erase(
+    task, ctx: RunContext, ws: Path, manifest: dict, targets: list[str]
+) -> Path:
+    stage = _begin_stage(task, manifest, "mask_erase")
+    separation = manifest.get("separation") or {}
+    if not separation.get("vocal") or not separation.get("accompaniment"):
+        raise TaskError("工作区缺少人声/伴奏分离产物，无法擦除")
+    vocal = ws / separation["vocal"]
+    accomp = ws / separation["accompaniment"]
+    if not vocal.is_file() or not accomp.is_file():
+        raise TaskError("人声/伴奏分离产物文件缺失，无法擦除")
+    target_set = set(targets)
+    intervals = union_intervals(
+        (float(s["start"]), float(s["end"]))
+        for s in _read_diarization_segments(ws)
+        if s["speaker"] in target_set
+    )
+
+    out_dir = ws / MASK_ERASE_DIR
+    out_dir.mkdir(exist_ok=True)
+    mix = out_dir / ERASED_MIX_FILENAME
+    script = out_dir / "mask_filter.txt"
+    script.write_text(build_mix_filter(intervals), encoding="utf-8")
+    run_ffmpeg(
+        [
+            "-i", str(vocal),
+            "-i", str(accomp),
+            "-filter_complex_script", str(script),
+            "-map", "[mix]",
+            "-ar", str(PCM_SAMPLE_RATE),
+            "-ac", "2",
+            "-c:a", "pcm_s16le",
+            str(mix),
+        ],
+        ctx.cancel_event,
+    )
+    rel = str(mix.relative_to(ws))
+    stage.artifacts.append(rel)
+    stage.outputs = {"erased_mix": rel}
+    stage.progress = 1.0
+    manifest["mask_erase"] = {"targets": targets, "intervals": intervals}
+    _end_stage(task, manifest, stage, StageStatus.DONE)
+    return mix
+
+
+def _mux_args(src: Path, mix: Path, tmp: Path, ext: str, full_streams: bool) -> list[str]:
+    args = ["-i", str(src), "-i", str(mix)]
+    if full_streams:
+        # 字幕/章节/附件等在容器允许时一并复制；源音频替换为擦除混音
+        args += ["-map", "0", "-map", "-0:a", "-map", "1:a:0"]
+    else:
+        args += ["-map", "0:v:0", "-map", "1:a:0"]
+    args += [
+        "-c:v", "copy",
+        "-c:a", "aac", "-b:a", "256k",
+        "-ar", str(PCM_SAMPLE_RATE),
+        "-ac", "2",
+        "-f", _MUXER_BY_EXT[ext],
+        str(tmp),
+    ]
+    return args
+
+
+def _stage_encode_mux(
+    task, ctx: RunContext, ws: Path, manifest: dict, src: Path, mix: Path,
+    targets: list[str],
+) -> None:
+    stage = _begin_stage(task, manifest, "encode_mux")
+    names = workspace.read_speaker_names(ws)
+    out = erased_output_path(src, targets, names, (task.erase or {}).get("output_dir"))
+    out.parent.mkdir(parents=True, exist_ok=True)
+    tmp = out.with_name(out.name + f".part-{os.getpid()}")
+    full_streams = True
     try:
-        run_ffmpeg(
-            [
-                "-i", str(src),
-                "-i", str(wav),
-                "-map", "0:v:0",
-                "-map", "1:a:0",
-                "-c:v", "copy",
-                "-c:a", "aac",
-                "-b:a", "256k",
-                "-ar", str(PCM_SAMPLE_RATE),
-                "-ac", "2",
-                "-f", _MUXER_BY_EXT[out_ext],
-                str(tmp),
-            ],
-            ctx.cancel_event,
-        )
-        os.replace(tmp, final)
+        try:
+            run_ffmpeg(_mux_args(src, mix, tmp, out.suffix, True), ctx.cancel_event)
+        except TaskError:
+            # 容器装不下全部流（如 MP4 装 PGS 字幕）：回退到仅视频+音频复制
+            full_streams = False
+            tmp.unlink(missing_ok=True)
+            run_ffmpeg(_mux_args(src, mix, tmp, out.suffix, False), ctx.cancel_event)
+        os.replace(tmp, out)
     except BaseException:
         Path(tmp).unlink(missing_ok=True)
         raise
-    manifest["output"] = {"path": str(final), "container": out_ext}
-    task.output_path = str(final)
+    manifest["output"] = {
+        "path": str(out),
+        "container": out.suffix,
+        "full_streams": full_streams,
+    }
+    task.output_path = str(out)
     _end_stage(task, manifest, stage, StageStatus.DONE)
 
 

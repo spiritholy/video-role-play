@@ -34,7 +34,7 @@ def paced_pipeline(monkeypatch):
         if ctx.cancel_event.is_set():
             raise TaskCancelled()
 
-    monkeypatch.setattr(pipeline_module, "execute", fake_execute)
+    monkeypatch.setattr(pipeline_module, "run_analysis", fake_execute)
     return started, release, order
 
 

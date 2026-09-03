@@ -84,6 +84,7 @@ interface Task {
   stages: Stage[];
   output_path: string | null;
   workspace_dir: string | null;
+  erase: { speakers: string[]; output_dir: string | null } | null;
   created_at: string;
 }
 
@@ -114,7 +115,10 @@ function trackLabel(t: ProbeTrack): string {
 }
 
 function stageSummary(task: Task): string {
-  if (task.state === "completed") return "全部阶段完成";
+  if (task.state === "completed") {
+    const eraseStage = task.stages.find((s) => s.id === "encode_mux");
+    return eraseStage?.status === "done" ? "擦除完成" : "分析完成，可选择要擦除的说话人";
+  }
   const idx = task.stages.findIndex((s) => s.status === "running");
   if (idx >= 0) return `阶段 ${idx + 1}/${task.stages.length} · ${task.stages[idx].name}`;
   const firstUndone = task.stages.findIndex(
@@ -360,16 +364,25 @@ export default function App() {
     }
 
     return (
-      <SpeakerTimeline
-        taskId={t.id}
-        timeline={timeline}
-        names={speakerNames[workspaceKey(t)] ?? {}}
-        samplesBySpeaker={samplesBySpeaker}
-        samplesHint={samplesHint}
-        playing={playing}
-        onPlay={playSegment}
-        onRename={(label, name) => renameSpeaker(t, label, name)}
-      />
+      <>
+        <SpeakerTimeline
+          taskId={t.id}
+          timeline={timeline}
+          names={speakerNames[workspaceKey(t)] ?? {}}
+          samplesBySpeaker={samplesBySpeaker}
+          samplesHint={samplesHint}
+          playing={playing}
+          onPlay={playSegment}
+          onRename={(label, name) => renameSpeaker(t, label, name)}
+        />
+        {t.state === "completed" && (
+          <EraseForm
+            task={t}
+            speakers={timeline.speakers}
+            names={speakerNames[workspaceKey(t)] ?? {}}
+          />
+        )}
+      </>
     );
   }
 
@@ -484,6 +497,101 @@ export default function App() {
 function fileName(path: string): string {
   const i = Math.max(path.lastIndexOf("/"), path.lastIndexOf("\\"));
   return i >= 0 ? path.slice(i + 1) : path;
+}
+
+function EraseForm({
+  task,
+  speakers,
+  names,
+}: {
+  task: Task;
+  speakers: TimelineSpeaker[];
+  names: Record<string, string>;
+}) {
+  const [selected, setSelected] = useState<Set<string>>(new Set());
+  const [outputDir, setOutputDir] = useState("");
+  const [error, setError] = useState<string | null>(null);
+  const [busy, setBusy] = useState(false);
+
+  function toggle(label: string) {
+    setSelected((prev) => {
+      const next = new Set(prev);
+      if (next.has(label)) next.delete(label);
+      else next.add(label);
+      return next;
+    });
+  }
+
+  async function submit() {
+    if (busy) return;
+    setError(null);
+    if (selected.size === 0) {
+      setError("请先勾选要擦除的说话人");
+      return;
+    }
+    setBusy(true);
+    try {
+      const resp = await fetch(`/api/tasks/${task.id}/erase`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          speakers: [...selected].sort(),
+          output_dir: outputDir.trim() || null,
+        }),
+      });
+      const data = await resp.json().catch(() => null);
+      if (!resp.ok) {
+        setError(data?.detail ?? "发起擦除失败");
+        return;
+      }
+      setSelected(new Set());
+    } catch {
+      setError("无法连接后端服务");
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  return (
+    <div className="erase-form">
+      <div className="erase-title">擦除目标说话人（可多选）</div>
+      <div className="erase-speakers">
+        {speakers.map((sp) => (
+          <label key={sp.label} className="erase-speaker">
+            <input
+              type="checkbox"
+              checked={selected.has(sp.label)}
+              onChange={() => toggle(sp.label)}
+            />
+            <span
+              className="dot"
+              style={{ background: speakerColor(speakers, sp.label) }}
+            />
+            {names[sp.label] ?? sp.label}
+          </label>
+        ))}
+      </div>
+      <div className="erase-row">
+        <label htmlFor={`erase-dir-${task.id}`}>输出目录</label>
+        <input
+          id={`erase-dir-${task.id}`}
+          type="text"
+          placeholder={`默认与源视频同目录（${dirName(task.video_path) || "/"}）`}
+          value={outputDir}
+          onChange={(e) => setOutputDir(e.target.value)}
+        />
+        <button type="button" className="primary" onClick={submit} disabled={busy}>
+          {busy ? "发起中…" : "发起擦除"}
+        </button>
+      </div>
+      {error && <p className="error-text">{error}</p>}
+    </div>
+  );
+}
+
+function dirName(path: string): string {
+  const i = Math.max(path.lastIndexOf("/"), path.lastIndexOf("\\"));
+  return i >= 0 ? path.slice(0, i) : "";
 }
 
 function SpeakerTimeline({

@@ -22,6 +22,10 @@ class TaskNotCancellable(Exception):
     """任务已结束，无法取消。"""
 
 
+class TaskNotErasable(Exception):
+    """任务当前状态不可发起擦除（需要已完成说话人分析）。"""
+
+
 class TaskManager:
     def __init__(self, workspace_root: Path, inference: Inference | None = None):
         self._workspace_root = Path(workspace_root)
@@ -83,6 +87,32 @@ class TaskManager:
                 task.finished_at = now_iso()
             return task
 
+    def erase(self, task_id: str, speakers: list[str], output_dir: str | None) -> Task:
+        """对任务发起擦除：重新排队运行掩码合成与编码封装。
+
+        放行已完成分析终态的任务（完成/失败/已取消）：昂贵的分析产物仍
+        在工作区，擦除失败后腾出磁盘重试、或换目标再擦都不该重跑分析；
+        擦除的可行性由说话人分离产物校验兜底（分析没跑到说话人分离的
+        任务没有该产物）。
+        """
+        with self._lock:
+            task = self._tasks.get(task_id)
+            if task is None:
+                raise KeyError(task_id)
+            if task.state in (TaskState.QUEUED, TaskState.RUNNING):
+                raise TaskNotErasable(task.state.value)
+            task.erase = {
+                "speakers": sorted(set(speakers)),  # 目标是说话人集合
+                "output_dir": output_dir,
+            }
+            task.error = None
+            task.finished_at = None
+            task.cancel_event.clear()
+            task.state = TaskState.QUEUED
+            self._queue.append(task.id)
+        self._wake.set()
+        return task
+
     def _worker(self) -> None:
         while not self._stop.is_set():
             task = self._claim_next()
@@ -109,17 +139,18 @@ class TaskManager:
             task.state = TaskState.RUNNING
             task.started_at = now_iso()
         try:
-            # 管线对取消事件做阶段边界与子进程内的检查：正常返回即完成
-            # （即使取消请求恰好晚于最后一个阶段结束，成品有效，按完成处理），
-            # 抛 TaskCancelled 才是取消。
-            pipeline.execute(
-                task,
-                RunContext(
-                    workspace_root=self._workspace_root,
-                    cancel_event=task.cancel_event,
-                    inference=self._inference,
-                ),
+            ctx = RunContext(
+                workspace_root=self._workspace_root,
+                cancel_event=task.cancel_event,
+                inference=self._inference,
             )
+            if task.erase:
+                # 管线对取消事件做阶段边界与子进程内的检查：正常返回即完成
+                # （即使取消请求恰好晚于最后一个阶段结束，产物有效，按完成
+                # 处理），抛 TaskCancelled 才是取消。
+                pipeline.run_erase(task, ctx)
+            else:
+                pipeline.run_analysis(task, ctx)
             self._finalize(task, TaskState.COMPLETED)
         except pipeline.TaskCancelled:
             self._finalize(task, TaskState.CANCELLED)
