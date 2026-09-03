@@ -8,7 +8,12 @@ from collections import deque
 from pathlib import Path
 
 from . import pipeline
-from .inference import DemucsSeparator, Inference, PyannoteDiarizer
+from .inference import (
+    DemucsSeparator,
+    Inference,
+    PyannoteDiarizer,
+    WhisperTranscriber,
+)
 from .models import Task, TaskState, now_iso
 from .pipeline import RunContext
 
@@ -21,7 +26,9 @@ class TaskManager:
     def __init__(self, workspace_root: Path, inference: Inference | None = None):
         self._workspace_root = Path(workspace_root)
         self._inference = inference or Inference(
-            separator=DemucsSeparator(), diarizer=PyannoteDiarizer()
+            separator=DemucsSeparator(),
+            diarizer=PyannoteDiarizer(),
+            transcriber=WhisperTranscriber(),
         )
         self._tasks: dict[str, Task] = {}
         self._queue: deque[str] = deque()

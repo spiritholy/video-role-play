@@ -21,7 +21,7 @@ def test_完成任务的阶段产物与清单落盘(client, tmp_path):
     assert manifest["state"] == "completed"
     assert manifest["output"]["path"] == task["output_path"]
     assert manifest["audio_track"]["index"] == 0
-    assert [s["status"] for s in manifest["stages"]] == ["done", "done", "done", "done"]
+    assert [s["status"] for s in manifest["stages"]] == ["done"] * 5
 
     stage_dirs = [p.name for p in ws.iterdir() if p.is_dir()]
     assert "01-audio-extract" in stage_dirs

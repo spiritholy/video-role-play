@@ -35,6 +35,20 @@ interface Timeline {
 
 type TimelineOrError = Timeline | "error";
 
+interface TranscriptSample {
+  speaker: string;
+  start: number;
+  end: number;
+  text: string;
+}
+
+interface Transcripts {
+  model: string;
+  samples: TranscriptSample[];
+}
+
+type TranscriptsOrError = Transcripts | "error";
+
 interface Playing {
   taskId: string;
   speaker: string;
@@ -118,9 +132,11 @@ function audioUrl(taskId: string, artifact: string): string {
 export default function App() {
   const [tasks, setTasks] = useState<Task[]>([]);
   const [timelines, setTimelines] = useState<Record<string, TimelineOrError>>({});
+  const [transcripts, setTranscripts] = useState<Record<string, TranscriptsOrError>>({});
   const [playing, setPlaying] = useState<Playing | null>(null);
   const audioRef = useRef<HTMLAudioElement | null>(null);
   const requestedTimelines = useRef<Set<string>>(new Set());
+  const requestedTranscripts = useRef<Set<string>>(new Set());
   const [videoPath, setVideoPath] = useState("");
   const [probe, setProbe] = useState<ProbeResult | null>(null);
   const [selectedTrack, setSelectedTrack] = useState(0);
@@ -147,16 +163,37 @@ export default function App() {
     [],
   );
 
+  const maybeFetchTranscripts = useCallback(
+    async (t: Task) => {
+      if (!t.stages.some((s) => s.id === "transcribe" && s.status === "done")) return;
+      if (requestedTranscripts.current.has(t.id)) return;
+      requestedTranscripts.current.add(t.id);
+      try {
+        const resp = await fetch(`/api/tasks/${t.id}/transcripts`);
+        if (!resp.ok) {
+          setTranscripts((prev) => ({ ...prev, [t.id]: "error" }));
+          return;
+        }
+        const data: Transcripts = await resp.json();
+        setTranscripts((prev) => ({ ...prev, [t.id]: data }));
+      } catch {
+        setTranscripts((prev) => ({ ...prev, [t.id]: "error" }));
+      }
+    },
+    [],
+  );
+
   const refresh = useCallback(async () => {
     try {
       const resp = await fetch("/api/tasks");
       const data = await resp.json();
       setTasks(data.tasks);
       data.tasks.forEach(maybeFetchTimeline);
+      data.tasks.forEach(maybeFetchTranscripts);
     } catch {
       // 后端暂不可达时保留旧列表，下一轮重试
     }
-  }, [maybeFetchTimeline]);
+  }, [maybeFetchTimeline, maybeFetchTranscripts]);
 
   useEffect(() => {
     refresh();
@@ -250,10 +287,35 @@ export default function App() {
     if (timeline === "error") {
       return <p className="timeline-hint">说话人时间轴加载失败</p>;
     }
+
+    const transcribeStage = t.stages.find((s) => s.id === "transcribe");
+    const data = transcripts[t.id];
+    let samplesHint: string | null = null;
+    let samplesBySpeaker: Record<string, TranscriptSample[]> = {};
+    if (data === undefined) {
+      if (
+        transcribeStage &&
+        (transcribeStage.status === "pending" ||
+          transcribeStage.status === "running")
+      ) {
+        samplesHint = "样本转写中…";
+      } else if (transcribeStage?.status === "done") {
+        samplesHint = "正在加载样本台词…";
+      }
+    } else if (data === "error") {
+      samplesHint = "样本台词加载失败";
+    } else {
+      for (const s of data.samples) {
+        (samplesBySpeaker[s.speaker] ??= []).push(s);
+      }
+    }
+
     return (
       <SpeakerTimeline
         taskId={t.id}
         timeline={timeline}
+        samplesBySpeaker={samplesBySpeaker}
+        samplesHint={samplesHint}
         playing={playing}
         onPlay={playSegment}
       />
@@ -376,11 +438,15 @@ function fileName(path: string): string {
 function SpeakerTimeline({
   taskId,
   timeline,
+  samplesBySpeaker,
+  samplesHint,
   playing,
   onPlay,
 }: {
   taskId: string;
   timeline: Timeline;
+  samplesBySpeaker: Record<string, TranscriptSample[]>;
+  samplesHint: string | null;
   playing: Playing | null;
   onPlay: (taskId: string, speaker: string, seg: TimelineSegment) => void;
 }) {
@@ -397,8 +463,10 @@ function SpeakerTimeline({
       <div className="timeline-title">
         说话人时间轴（共 {timeline.num_speakers} 人，点击任意时段试听）
       </div>
+      {samplesHint && <p className="timeline-hint">{samplesHint}</p>}
       {timeline.speakers.map((sp) => {
         const color = speakerColor(timeline.speakers, sp.label);
+        const samples = samplesBySpeaker[sp.label] ?? [];
         return (
           <div key={sp.label} className="timeline-row">
             <span className="speaker-chip">
@@ -423,6 +491,29 @@ function SpeakerTimeline({
                 />
               ))}
             </div>
+            {samples.length > 0 && (
+              <div className="speaker-samples">
+                <span className="samples-label">样本台词</span>
+                <div className="sample-list">
+                  {samples.map((s, i) => (
+                    <button
+                      key={i}
+                      type="button"
+                      className={`sample${isActive(sp, s) ? " playing" : ""}`}
+                      title={`试听样本 ${fmtTime(s.start)} – ${fmtTime(s.end)}`}
+                      onClick={() => onPlay(taskId, sp.label, s)}
+                    >
+                      <span className="sample-time">
+                        {fmtTime(s.start)}–{fmtTime(s.end)}
+                      </span>
+                      <span className="sample-text">
+                        {s.text || "（无可识别台词）"}
+                      </span>
+                    </button>
+                  ))}
+                </div>
+              </div>
+            )}
           </div>
         );
       })}

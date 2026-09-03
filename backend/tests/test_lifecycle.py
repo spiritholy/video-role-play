@@ -25,5 +25,6 @@ def test_提交源视频创建任务并运行到完成(client, tmp_path):
         "audio_extract": "done",
         "separate": "done",
         "diarize": "done",
+        "transcribe": "done",
         "encode_mux": "done",
     }

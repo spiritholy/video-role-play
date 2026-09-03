@@ -1,13 +1,16 @@
-"""处理任务管线：音轨提取/降混 → 人声/伴奏分离 → 说话人分离 → 编码封装基线。
+"""处理任务管线：音轨提取/降混 → 人声/伴奏分离 → 说话人分离 → 样本转写
+→ 编码封装基线。
 
 ML 阶段经统一 ML 推理接口（inference.Inference）调用，生产为 Demucs /
-pyannote、测试注入 canned 输出；工作区阶段清单为后续断点续跑与复用提供结构。
+pyannote / Whisper、测试注入 canned 输出；工作区阶段清单为后续断点续跑
+与复用提供结构。
 """
 
 from __future__ import annotations
 
 import json
 import os
+import wave
 from dataclasses import dataclass
 from pathlib import Path
 import threading
@@ -16,6 +19,7 @@ from . import workspace
 from .inference import DiarizationResult, Inference, SeparationStems
 from .media import TaskCancelled, TaskError, audio_tracks, ffprobe_json, run_ffmpeg
 from .models import StageStatus, now_iso
+from .samples import select_samples
 
 # 官方支持 AAC 的容器；其余（如 WebM）落到 MKV
 AAC_CONTAINERS = {".mp4", ".m4v", ".mov", ".mkv"}
@@ -27,6 +31,8 @@ PCM_SAMPLE_RATE = 48000
 
 DIARIZATION_DIR = "03-diarize"
 DIARIZATION_FILENAME = "diarization.json"
+TRANSCRIBE_DIR = "04-transcribe"
+TRANSCRIPTION_FILENAME = "transcripts.json"
 
 
 @dataclass
@@ -48,6 +54,7 @@ def execute(task, ctx: RunContext) -> None:
         "audio_track": None,
         "separation": None,
         "diarization": None,
+        "transcription": None,
         "output": None,
         "state": "running",
         "error": None,
@@ -66,7 +73,8 @@ def execute(task, ctx: RunContext) -> None:
     try:
         wav = _stage_audio_extract(task, ctx, ws, manifest)
         _stage_separate(task, ctx, ws, manifest, wav)
-        _stage_diarize(task, ctx, ws, manifest, wav)
+        diarization = _stage_diarize(task, ctx, ws, manifest, wav)
+        _stage_transcribe(task, ctx, ws, manifest, wav, diarization)
         _stage_encode_mux(task, ctx, ws, manifest, src, wav)
         manifest["state"] = "completed"
     except TaskCancelled:
@@ -221,6 +229,68 @@ def _stage_diarize(
     }
     _end_stage(task, manifest, stage, StageStatus.DONE)
     return diarization
+
+
+def _stage_transcribe(
+    task,
+    ctx: RunContext,
+    ws: Path,
+    manifest: dict,
+    wav: Path,
+    diarization: DiarizationResult,
+) -> None:
+    stage = _begin_stage(task, manifest, "transcribe")
+    out_dir = ws / TRANSCRIBE_DIR
+    out_dir.mkdir(exist_ok=True)
+
+    samples = select_samples(list(diarization.segments), _wav_duration(wav))
+
+    def on_progress(fraction: float) -> None:
+        stage.progress = max(0.0, min(1.0, float(fraction)))
+        _check_cancelled(ctx.cancel_event)
+
+    try:
+        result = ctx.inference.transcriber.transcribe(wav, samples, on_progress)
+    except (TaskCancelled, TaskError):
+        raise
+    except Exception as e:
+        raise TaskError(f"样本转写失败: {e}") from e
+
+    data = {
+        "version": 1,
+        "model": ctx.inference.transcriber.name,
+        "samples": [
+            {
+                "speaker": t.sample.speaker,
+                "start": t.sample.start,
+                "end": t.sample.end,
+                "text": t.text,
+            }
+            for t in result.transcripts
+        ],
+    }
+    artifact = out_dir / TRANSCRIPTION_FILENAME
+    artifact.write_text(
+        json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8"
+    )
+    rel = str(artifact.relative_to(ws))
+    stage.artifacts.append(rel)
+    stage.outputs = {"transcripts": rel}
+    stage.progress = 1.0
+    manifest["transcription"] = {
+        "model": ctx.inference.transcriber.name,
+        "samples": rel,
+    }
+    _end_stage(task, manifest, stage, StageStatus.DONE)
+
+
+def _wav_duration(wav: Path) -> float:
+    """降混 PCM wav 的时长（秒）；读取失败按 0 处理（仅影响分散约束）。"""
+    try:
+        with wave.open(str(wav), "rb") as w:
+            return w.getnframes() / w.getframerate()
+    except (wave.Error, OSError):
+        return 0.0
 
 
 def _stage_encode_mux(

@@ -1,17 +1,19 @@
 """ML 推理注入边界：全项目唯一的测试注入点。
 
 生产环境经此调用真实模型（Demucs 是人声/伴奏分离的接入者，pyannote 是
-说话人分离的接入者，Whisper 由后续 issue 接入）；行为测试注入 canned 输出，
-真实模型与权重下载不进测试回路。
+说话人分离的接入者，Whisper 是样本转写的接入者）；行为测试注入 canned
+输出，真实模型与权重下载不进测试回路。
 接口约定：separate() 在独立目录产出 stems 文件，经 on_progress(0..1) 汇报
-进度；diarize() 返回结构化说话人时段（由管线序列化落盘）。取消通过
-on_progress 抛 TaskCancelled 实现（管线负责注入）。
+进度；diarize() 返回结构化说话人时段（由管线序列化落盘）；transcribe()
+只转写传入的样本段（范围限定由管线负责，转写者不触碰其余音频）。
+取消通过 on_progress 抛 TaskCancelled 实现（管线负责注入）。
 """
 
 from __future__ import annotations
 
 import math
 import os
+from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Protocol
@@ -53,6 +55,19 @@ class DiarizationResult:
     segments: tuple[SpeakerSegment, ...]
 
 
+@dataclass(frozen=True)
+class Transcription:
+    """一个样本段的转写台词（"看台词认人"的展示单元）。"""
+
+    sample: SpeakerSegment
+    text: str
+
+
+@dataclass(frozen=True)
+class TranscriptionResult:
+    transcripts: tuple[Transcription, ...]
+
+
 class VocalSeparator(Protocol):
     name: str
 
@@ -69,12 +84,24 @@ class SpeakerDiarizer(Protocol):
     ) -> DiarizationResult: ...
 
 
+class Transcriber(Protocol):
+    name: str
+
+    def transcribe(
+        self,
+        wav: Path,
+        samples: Sequence[SpeakerSegment],
+        on_progress: ProgressCallback,
+    ) -> TranscriptionResult: ...
+
+
 @dataclass
 class Inference:
-    """统一注入容器：pyannote 已接入，Whisper 由后续 issue 接口挂在这里。"""
+    """统一注入容器：Demucs / pyannote / Whisper 三个接入者挂在这里。"""
 
     separator: VocalSeparator
     diarizer: SpeakerDiarizer
+    transcriber: Transcriber
 
 
 def read_hf_token() -> str | None:
@@ -252,6 +279,9 @@ class PyannoteDiarizer:
             self._pipeline = factory(token)
         except TaskError:
             raise
+        except (GatedRepoError, RepositoryNotFoundError) as e:
+            # 403 = 协议未接受；401/404（hub 将无效 token 折叠成"仓库不存在"）
+            raise TaskError(_TOKEN_REJECTED_MESSAGE) from e
         except Exception as e:
             raise TaskError(
                 f"pyannote 模型加载失败：{e}。首次使用需联网下载模型"
@@ -286,8 +316,92 @@ class PyannoteDiarizer:
             raise TaskError(
                 "缺少依赖 pyannote.audio：请先安装 backend/requirements.txt"
             ) from e
+        return Pipeline.from_pretrained(model_id, use_auth_token=token)
+
+
+# Whisper 内部统一的工作采样率（decode_audio 的重采样目标）
+WHISPER_SAMPLE_RATE = 16000
+
+
+class WhisperTranscriber:
+    """faster-whisper（CPU）样本段转写，第三个接入推理接口的模型。
+
+    英文优先：默认 base.en（英文专用小模型，识别英文台词）。权重托管在
+    HuggingFace 公开仓库，无需账号、非门控，首次使用自动下载，之后完全
+    离线。只转写传入的样本段：整条音频解码一次，按窗口切片送模型，
+    样本段之外的音频不进入模型。
+    """
+
+    name = "faster-whisper/base.en"
+
+    def __init__(self, model_name: str = "base.en", model_factory=None,
+                 audio_loader=None):
+        self._model_name = model_name
+        # model_factory / audio_loader 仅用于测试注入；生产走
+        # faster_whisper.WhisperModel 与 faster_whisper.audio.decode_audio
+        self._model_factory = model_factory
+        self._audio_loader = audio_loader
+        self._model = None
+
+    def load_model(self):
+        """懒加载并缓存模型；首次调用触发权重下载（无需账号）。"""
+        if self._model is not None:
+            return self._model
+        if self._model_factory is None:
+            try:
+                from faster_whisper import WhisperModel
+            except ImportError as e:
+                raise TaskError(
+                    "缺少依赖 faster-whisper：请先安装 backend/requirements.txt"
+                ) from e
+            self._model_factory = lambda: WhisperModel(
+                self._model_name, device="cpu", compute_type="int8"
+            )
         try:
-            return Pipeline.from_pretrained(model_id, use_auth_token=token)
-        except (GatedRepoError, RepositoryNotFoundError) as e:
-            # 403 = 协议未接受；401/404（hub 将无效 token 折叠成"仓库不存在"）
-            raise TaskError(_TOKEN_REJECTED_MESSAGE) from e
+            self._model = self._model_factory()
+        except TaskError:
+            raise
+        except Exception as e:
+            raise TaskError(
+                f"Whisper 模型权重获取失败（{self._model_name}）：{e}。"
+                "首次使用需联网自动下载权重（公开地址，无需账号），"
+                "请检查网络连接后重试。"
+            ) from e
+        return self._model
+
+    def _load_audio(self, wav: Path):
+        if self._audio_loader is not None:
+            return self._audio_loader(wav)
+        try:
+            from faster_whisper.audio import decode_audio
+        except ImportError as e:
+            raise TaskError(
+                "缺少依赖 faster-whisper：请先安装 backend/requirements.txt"
+            ) from e
+        return decode_audio(str(wav), sampling_rate=WHISPER_SAMPLE_RATE)
+
+    def transcribe(
+        self,
+        wav: Path,
+        samples: Sequence[SpeakerSegment],
+        on_progress: ProgressCallback,
+    ) -> TranscriptionResult:
+        model = self.load_model()
+        audio = self._load_audio(wav)
+        transcripts: list[Transcription] = []
+        for i, sample in enumerate(samples):
+            # 严格限定样本段：只把窗口内的采样点交给模型
+            chunk = audio[
+                int(sample.start * WHISPER_SAMPLE_RATE):
+                int(sample.end * WHISPER_SAMPLE_RATE)
+            ]
+            try:
+                segments, _info = model.transcribe(chunk)
+                text = " ".join(s.text.strip() for s in segments).strip()
+            except (TaskCancelled, TaskError):
+                raise
+            except Exception as e:
+                raise TaskError(f"Whisper 样本转写失败: {e}") from e
+            transcripts.append(Transcription(sample=sample, text=text))
+            on_progress((i + 1) / len(samples))
+        return TranscriptionResult(transcripts=tuple(transcripts))

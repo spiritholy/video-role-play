@@ -146,6 +146,33 @@ def create_app(
             "speakers": [speakers[k] for k in sorted(speakers)],
         }
 
+    @app.get("/api/tasks/{task_id}/transcripts")
+    def get_transcripts(task_id: str):
+        """样本转写数据：每个说话人的样本段区间与文字台词（"看台词认人"）。"""
+        task = manager.get(task_id)
+        if task is None or task.workspace_dir is None:
+            raise HTTPException(status_code=404, detail="任务不存在")
+        stage = _stage_of(task, "transcribe")
+        artifact = stage.outputs.get("transcripts") if stage else None
+        if artifact is None:
+            raise HTTPException(status_code=404, detail="样本转写尚未完成")
+        path = Path(task.workspace_dir) / artifact
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            raise HTTPException(status_code=404, detail="样本转写产物缺失")
+        samples = [
+            {
+                "speaker": s["speaker"],
+                "start": float(s["start"]),
+                "end": float(s["end"]),
+                "text": s["text"],
+            }
+            for s in data.get("samples", [])
+        ]
+        samples.sort(key=lambda s: (s["speaker"], s["start"]))
+        return {"model": data.get("model"), "samples": samples}
+
     @app.get("/api/tasks/{task_id}/audio-segment")
     def listen_segment(
         task_id: str,

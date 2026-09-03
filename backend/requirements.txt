@@ -27,3 +27,12 @@ soundfile==0.14.0
 tensorboardx==2.6.5
 torch-audiomentations==0.12.0
 pytorch-metric-learning==2.9.0
+# 样本转写（faster-whisper：权重托管在 HF 公开仓库，无需账号、非门控，
+# 首次使用自动下载后离线；英文优先，默认 base.en 模型）
+faster-whisper==1.1.0
+# faster-whisper 1.1.0 生态锁定：ctranslate2 <5、onnxruntime <2、tokenizers <1，
+# 均与 numpy 1.x 同期，避免解析出 numpy 2 组合
+ctranslate2==4.8.2
+onnxruntime==1.23.2
+av==17.1.0
+tokenizers==0.23.2

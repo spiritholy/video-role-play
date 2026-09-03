@@ -1,7 +1,8 @@
 """共享 fixture：真实 ffmpeg 合成秒级视频 + 走 HTTP API 的测试客户端。
 
 ML 推理走全项目唯一注入边界：默认 client 注入 CannedSeparator（canned
-stems），真实模型与权重下载永不进入测试回路。
+stems）、CannedDiarizer（canned 说话人时段）与 CannedTranscriber（canned
+转写文本），真实模型与权重下载永不进入测试回路。
 """
 
 import json
@@ -23,6 +24,8 @@ from app.inference import (
     Inference,
     SeparationStems,
     SpeakerSegment,
+    Transcription,
+    TranscriptionResult,
 )
 from app.main import create_app
 
@@ -112,17 +115,50 @@ def client(tmp_path: Path) -> TestClient:
 
 
 @contextmanager
-def make_client(tmp_path: Path, separator=None, diarizer=None):
-    """按需注入自定义 separator/diarizer（不传时用默认 canned）的测试客户端工厂。"""
+def make_client(tmp_path: Path, separator=None, diarizer=None, transcriber=None):
+    """按需注入自定义 separator/diarizer/transcriber（不传时用默认 canned）
+    的测试客户端工厂。"""
     app = create_app(
         workspace_root=tmp_path / "workspaces",
         inference=Inference(
             separator=separator or CannedSeparator(),
             diarizer=diarizer or CannedDiarizer(),
+            transcriber=transcriber or CannedTranscriber(),
         ),
     )
     with TestClient(app) as c:
         yield c
+
+
+class CannedTranscriber:
+    """样本转写替身：对每个样本段回一个 canned 台词，不触碰真实模型。
+
+    记录收到的样本段供"转写范围严格限定"断言；fail 模拟生产 transcriber
+    已映射完成的干净错误；gate 用于把转写停驻在进度回调处，确定性观察
+    进度与取消。
+    """
+
+    name = "canned-whisper"
+
+    def __init__(self, fail: Exception | None = None,
+                 gate: threading.Event | None = None):
+        self.fail = fail
+        self.gate = gate
+        self.calls: list[tuple[Path, tuple[SpeakerSegment, ...]]] = []
+
+    def transcribe(self, wav: Path, samples, on_progress) -> TranscriptionResult:
+        self.calls.append((Path(wav), tuple(samples)))
+        if self.fail is not None:
+            raise self.fail
+        transcripts = tuple(
+            Transcription(sample=s, text=f"台词 {i}（{s.speaker}）")
+            for i, s in enumerate(samples)
+        )
+        on_progress(0.5)
+        if self.gate is not None:
+            self.gate.wait(timeout=60)
+        on_progress(1.0)
+        return TranscriptionResult(transcripts=transcripts)
 
 
 class CannedDiarizer:
