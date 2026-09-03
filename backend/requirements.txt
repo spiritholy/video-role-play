@@ -10,3 +10,20 @@ torchaudio==2.4.1+cpu
 demucs==4.1.0
 # demucs 4.1.0 运行必需但未声明；<2 兼容 torch 2.4.1
 numpy==1.26.4
+# 说话人分离（pyannote 为门控模型：首次使用需 HF token 并在线接受协议，下载后离线）
+pyannote.audio==3.1.0
+# pyannote.audio 3.1.0 生态锁定：huggingface_hub 1.x API 不兼容（异常签名变化），
+# 其余锁在与 pyannote 3.1 / numpy 1.x 同期版本，避免解析出 numpy 2 组合
+huggingface_hub==0.25.2
+lightning==2.1.4
+speechbrain==0.5.16
+pyannote.core==5.0.0
+pyannote.metrics==3.2.1
+pyannote.pipeline==3.0.1
+scikit-learn==1.5.2
+scipy==1.13.1
+# pyannote.audio 3.1.0 声明的推理依赖（--no-deps 或解析漂移时兜底锁定）
+soundfile==0.14.0
+tensorboardx==2.6.5
+torch-audiomentations==0.12.0
+pytorch-metric-learning==2.9.0

@@ -28,10 +28,11 @@ STATE_LABELS = {
     TaskState.CANCELLED: "已取消",
 }
 
-# 处理任务阶段（骨架闭环：提取→分离→封装；后续 issue 插入擦除相关阶段）
+# 处理任务阶段（提取→分离→说话人分离→封装；后续 issue 插入转写与擦除阶段）
 STAGE_DEFS = [
     ("audio_extract", "音轨提取/降混"),
     ("separate", "人声/伴奏分离"),
+    ("diarize", "说话人分离"),
     ("encode_mux", "编码封装基线"),
 ]
 

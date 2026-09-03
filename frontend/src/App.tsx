@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 
 interface Stage {
   id: string;
@@ -14,6 +14,50 @@ const STEM_LABELS: Record<string, string> = {
   vocal: "人声轨",
   accompaniment: "伴奏轨",
 };
+
+interface TimelineSegment {
+  start: number;
+  end: number;
+}
+
+interface TimelineSpeaker {
+  label: string;
+  speech_time: number;
+  segments: TimelineSegment[];
+}
+
+interface Timeline {
+  model: string;
+  num_speakers: number;
+  duration: number;
+  speakers: TimelineSpeaker[];
+}
+
+type TimelineOrError = Timeline | "error";
+
+interface Playing {
+  taskId: string;
+  speaker: string;
+  start: number;
+  end: number;
+}
+
+const SPEAKER_COLORS = [
+  "#4f7cff", "#e0533d", "#2ba24c", "#9d5bd2",
+  "#e8a13a", "#2ab5b5", "#d45791", "#7a8699",
+];
+
+function speakerColor(speakers: TimelineSpeaker[], label: string): string {
+  const i = speakers.findIndex((s) => s.label === label);
+  return SPEAKER_COLORS[i % SPEAKER_COLORS.length];
+}
+
+function fmtTime(t: number): string {
+  if (t < 60) return `${t.toFixed(1)}s`;
+  const m = Math.floor(t / 60);
+  const s = Math.round(t % 60);
+  return `${m}:${String(s).padStart(2, "0")}`;
+}
 
 interface Task {
   id: string;
@@ -73,27 +117,69 @@ function audioUrl(taskId: string, artifact: string): string {
 
 export default function App() {
   const [tasks, setTasks] = useState<Task[]>([]);
+  const [timelines, setTimelines] = useState<Record<string, TimelineOrError>>({});
+  const [playing, setPlaying] = useState<Playing | null>(null);
+  const audioRef = useRef<HTMLAudioElement | null>(null);
+  const requestedTimelines = useRef<Set<string>>(new Set());
   const [videoPath, setVideoPath] = useState("");
   const [probe, setProbe] = useState<ProbeResult | null>(null);
   const [selectedTrack, setSelectedTrack] = useState(0);
   const [formError, setFormError] = useState<string | null>(null);
   const [probing, setProbing] = useState(false);
 
+  const maybeFetchTimeline = useCallback(
+    async (t: Task) => {
+      if (!t.stages.some((s) => s.id === "diarize" && s.status === "done")) return;
+      if (requestedTimelines.current.has(t.id)) return;
+      requestedTimelines.current.add(t.id);
+      try {
+        const resp = await fetch(`/api/tasks/${t.id}/diarization`);
+        if (!resp.ok) {
+          setTimelines((prev) => ({ ...prev, [t.id]: "error" }));
+          return;
+        }
+        const data: Timeline = await resp.json();
+        setTimelines((prev) => ({ ...prev, [t.id]: data }));
+      } catch {
+        setTimelines((prev) => ({ ...prev, [t.id]: "error" }));
+      }
+    },
+    [],
+  );
+
   const refresh = useCallback(async () => {
     try {
       const resp = await fetch("/api/tasks");
       const data = await resp.json();
       setTasks(data.tasks);
+      data.tasks.forEach(maybeFetchTimeline);
     } catch {
       // 后端暂不可达时保留旧列表，下一轮重试
     }
-  }, []);
+  }, [maybeFetchTimeline]);
 
   useEffect(() => {
     refresh();
     const timer = setInterval(refresh, 1000);
     return () => clearInterval(timer);
   }, [refresh]);
+
+  useEffect(() => {
+    return () => {
+      audioRef.current?.pause();
+      audioRef.current = null;
+    };
+  }, []);
+
+  function playSegment(taskId: string, speaker: string, seg: TimelineSegment) {
+    if (!audioRef.current) audioRef.current = new Audio();
+    const audio = audioRef.current;
+    audio.pause();
+    audio.src = `/api/tasks/${taskId}/audio-segment?start=${seg.start}&end=${seg.end}`;
+    audio.onended = () => setPlaying(null);
+    audio.play().catch(() => setPlaying(null));
+    setPlaying({ taskId, speaker, start: seg.start, end: seg.end });
+  }
 
   async function handleProbe() {
     setFormError(null);
@@ -154,6 +240,24 @@ export default function App() {
   async function handleCancel(id: string) {
     await fetch(`/api/tasks/${id}/cancel`, { method: "POST" });
     refresh();
+  }
+
+  function renderTimeline(t: Task) {
+    const timeline = timelines[t.id];
+    if (timeline === undefined) {
+      return <p className="timeline-hint">正在加载说话人时间轴…</p>;
+    }
+    if (timeline === "error") {
+      return <p className="timeline-hint">说话人时间轴加载失败</p>;
+    }
+    return (
+      <SpeakerTimeline
+        taskId={t.id}
+        timeline={timeline}
+        playing={playing}
+        onPlay={playSegment}
+      />
+    );
   }
 
   return (
@@ -250,6 +354,8 @@ export default function App() {
                     ))}
                   </div>
                 ))}
+              {t.stages.some((s) => s.id === "diarize" && s.status === "done") &&
+                renderTimeline(t)}
               {t.error && <p className="error-text">失败原因：{t.error}</p>}
               {t.output_path && (
                 <p className="output-text">成品：{t.output_path}</p>
@@ -265,4 +371,72 @@ export default function App() {
 function fileName(path: string): string {
   const i = Math.max(path.lastIndexOf("/"), path.lastIndexOf("\\"));
   return i >= 0 ? path.slice(i + 1) : path;
+}
+
+function SpeakerTimeline({
+  taskId,
+  timeline,
+  playing,
+  onPlay,
+}: {
+  taskId: string;
+  timeline: Timeline;
+  playing: Playing | null;
+  onPlay: (taskId: string, speaker: string, seg: TimelineSegment) => void;
+}) {
+  const pct = (v: number) => `${((v / timeline.duration) * 100).toFixed(3)}%`;
+  const isActive = (sp: TimelineSpeaker, seg: TimelineSegment) =>
+    playing !== null &&
+    playing.taskId === taskId &&
+    playing.speaker === sp.label &&
+    playing.start === seg.start &&
+    playing.end === seg.end;
+
+  return (
+    <div className="timeline">
+      <div className="timeline-title">
+        说话人时间轴（共 {timeline.num_speakers} 人，点击任意时段试听）
+      </div>
+      {timeline.speakers.map((sp) => {
+        const color = speakerColor(timeline.speakers, sp.label);
+        return (
+          <div key={sp.label} className="timeline-row">
+            <span className="speaker-chip">
+              <span className="dot" style={{ background: color }} />
+              {sp.label}
+              <span className="speech-time">{fmtTime(sp.speech_time)}</span>
+            </span>
+            <div className="timeline-track">
+              {sp.segments.map((seg, i) => (
+                <button
+                  key={i}
+                  type="button"
+                  className={`timeline-seg${isActive(sp, seg) ? " playing" : ""}`}
+                  style={{
+                    left: pct(seg.start),
+                    width: pct(seg.end - seg.start),
+                    background: color,
+                  }}
+                  title={`${sp.label} · ${fmtTime(seg.start)} – ${fmtTime(seg.end)}`}
+                  aria-label={`试听 ${sp.label}，${fmtTime(seg.start)} 到 ${fmtTime(seg.end)}`}
+                  onClick={() => onPlay(taskId, sp.label, seg)}
+                />
+              ))}
+            </div>
+          </div>
+        );
+      })}
+      {timeline.duration > 0 && (
+        <div className="timeline-axis">
+          <span />
+          <div>
+            {Array.from({ length: 5 }, (_, i) => (
+              <span key={i}>{fmtTime((timeline.duration * i) / 4)}</span>
+            ))}
+          </div>
+          <span />
+        </div>
+      )}
+    </div>
+  );
 }

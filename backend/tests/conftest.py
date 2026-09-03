@@ -19,8 +19,10 @@ from fastapi.testclient import TestClient
 from app.inference import (
     ACCOMPANIMENT_FILENAME,
     VOCALS_FILENAME,
+    DiarizationResult,
     Inference,
     SeparationStems,
+    SpeakerSegment,
 )
 from app.main import create_app
 
@@ -110,14 +112,50 @@ def client(tmp_path: Path) -> TestClient:
 
 
 @contextmanager
-def make_client(tmp_path: Path, separator=None):
-    """按需注入自定义 separator（不传时用默认 canned）的测试客户端工厂。"""
+def make_client(tmp_path: Path, separator=None, diarizer=None):
+    """按需注入自定义 separator/diarizer（不传时用默认 canned）的测试客户端工厂。"""
     app = create_app(
         workspace_root=tmp_path / "workspaces",
-        inference=Inference(separator=separator or CannedSeparator()),
+        inference=Inference(
+            separator=separator or CannedSeparator(),
+            diarizer=diarizer or CannedDiarizer(),
+        ),
     )
     with TestClient(app) as c:
         yield c
+
+
+class CannedDiarizer:
+    """说话人分离替身：返回固定说话人时段，不触碰真实模型。
+
+    fail 模拟生产 diarizer 已映射完成的干净错误；gate 用于把 diarize
+    停驻在进度回调处，确定性观察进度与取消。
+    """
+
+    name = "canned-diarizer"
+
+    DEFAULT_TURNS = (
+        SpeakerSegment("SPEAKER_00", 0.2, 0.9),
+        SpeakerSegment("SPEAKER_01", 0.95, 1.25),
+        SpeakerSegment("SPEAKER_00", 1.3, 1.8),
+    )
+
+    def __init__(self, turns=DEFAULT_TURNS, fail: Exception | None = None,
+                 gate: threading.Event | None = None):
+        self.turns = tuple(turns)
+        self.fail = fail
+        self.gate = gate
+        self.calls: list[Path] = []
+
+    def diarize(self, wav: Path, out_dir: Path, on_progress) -> DiarizationResult:
+        self.calls.append(Path(wav))
+        if self.fail is not None:
+            raise self.fail
+        on_progress(0.5)
+        if self.gate is not None:
+            self.gate.wait(timeout=60)
+        on_progress(1.0)
+        return DiarizationResult(segments=self.turns)
 
 
 class CannedSeparator:

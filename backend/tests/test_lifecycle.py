@@ -24,5 +24,6 @@ def test_提交源视频创建任务并运行到完成(client, tmp_path):
     assert stages == {
         "audio_extract": "done",
         "separate": "done",
+        "diarize": "done",
         "encode_mux": "done",
     }

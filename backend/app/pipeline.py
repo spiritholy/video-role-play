@@ -1,18 +1,19 @@
-"""处理任务管线：音轨提取/降混 → 人声/伴奏分离 → 编码封装基线。
+"""处理任务管线：音轨提取/降混 → 人声/伴奏分离 → 说话人分离 → 编码封装基线。
 
-分离经统一 ML 推理接口（inference.Inference）调用，生产为 Demucs、
-测试注入 canned stems；工作区阶段清单为后续断点续跑与复用提供结构。
+ML 阶段经统一 ML 推理接口（inference.Inference）调用，生产为 Demucs /
+pyannote、测试注入 canned 输出；工作区阶段清单为后续断点续跑与复用提供结构。
 """
 
 from __future__ import annotations
 
+import json
 import os
 from dataclasses import dataclass
 from pathlib import Path
 import threading
 
 from . import workspace
-from .inference import Inference, SeparationStems
+from .inference import DiarizationResult, Inference, SeparationStems
 from .media import TaskCancelled, TaskError, audio_tracks, ffprobe_json, run_ffmpeg
 from .models import StageStatus, now_iso
 
@@ -23,6 +24,9 @@ _MUXER_BY_EXT = {".mp4": "mp4", ".m4v": "mp4", ".mov": "mov", ".mkv": "matroska"
 OUTPUT_SUFFIX = "__baseline"
 
 PCM_SAMPLE_RATE = 48000
+
+DIARIZATION_DIR = "03-diarize"
+DIARIZATION_FILENAME = "diarization.json"
 
 
 @dataclass
@@ -43,6 +47,7 @@ def execute(task, ctx: RunContext) -> None:
         "requested_audio_track": task.audio_track,
         "audio_track": None,
         "separation": None,
+        "diarization": None,
         "output": None,
         "state": "running",
         "error": None,
@@ -61,6 +66,7 @@ def execute(task, ctx: RunContext) -> None:
     try:
         wav = _stage_audio_extract(task, ctx, ws, manifest)
         _stage_separate(task, ctx, ws, manifest, wav)
+        _stage_diarize(task, ctx, ws, manifest, wav)
         _stage_encode_mux(task, ctx, ws, manifest, src, wav)
         manifest["state"] = "completed"
     except TaskCancelled:
@@ -165,6 +171,56 @@ def _stage_separate(
     }
     _end_stage(task, manifest, stage, StageStatus.DONE)
     return stems
+
+
+def _stage_diarize(
+    task, ctx: RunContext, ws: Path, manifest: dict, wav: Path
+) -> DiarizationResult:
+    stage = _begin_stage(task, manifest, "diarize")
+    out_dir = ws / DIARIZATION_DIR
+    out_dir.mkdir(exist_ok=True)
+
+    def on_progress(fraction: float) -> None:
+        stage.progress = max(0.0, min(1.0, float(fraction)))
+        _check_cancelled(ctx.cancel_event)
+
+    try:
+        diarization = ctx.inference.diarizer.diarize(wav, out_dir, on_progress)
+    except (TaskCancelled, TaskError):
+        raise
+    except Exception as e:
+        raise TaskError(f"说话人分离失败: {e}") from e
+
+    if not diarization.segments:
+        raise TaskError(
+            "未检测到任何说话人：所选音轨可能没有人声，请确认选择了正确的音轨"
+        )
+
+    speakers = sorted({s.speaker for s in diarization.segments})
+    data = {
+        "version": 1,
+        "model": ctx.inference.diarizer.name,
+        "num_speakers": len(speakers),
+        "segments": [
+            {"speaker": s.speaker, "start": s.start, "end": s.end}
+            for s in diarization.segments
+        ],
+    }
+    artifact = out_dir / DIARIZATION_FILENAME
+    artifact.write_text(
+        json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8"
+    )
+    rel = str(artifact.relative_to(ws))
+    stage.artifacts.append(rel)
+    stage.outputs = {"diarization": rel}
+    stage.progress = 1.0
+    manifest["diarization"] = {
+        "model": ctx.inference.diarizer.name,
+        "num_speakers": len(speakers),
+        "segments": rel,
+    }
+    _end_stage(task, manifest, stage, StageStatus.DONE)
+    return diarization
 
 
 def _stage_encode_mux(

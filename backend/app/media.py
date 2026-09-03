@@ -70,6 +70,18 @@ def run_ffmpeg(args: list[str], cancel_event: threading.Event) -> None:
         raise TaskError(f"ffmpeg 执行失败: {_tail(''.join(stderr_lines))}")
 
 
+def run_ffmpeg_bytes(args: list[str]) -> bytes:
+    """运行 ffmpeg 并返回 stdout 字节流（切片等内存输出）；失败抛 TaskError。"""
+    proc = subprocess.run(
+        [FFMPEG, "-v", "error", *args],
+        capture_output=True,
+    )
+    if proc.returncode != 0:
+        stderr = proc.stderr.decode(errors="replace")
+        raise TaskError(f"ffmpeg 执行失败: {_tail(stderr)}")
+    return proc.stdout
+
+
 def _tail(text: str, limit: int = 400) -> str:
     text = (text or "").strip()
     return text[-limit:]
