@@ -83,6 +83,9 @@ class Task:
     finished_at: str | None = None
     output_path: str | None = None
     workspace_dir: str | None = None
+    # 用户指定的说话人数量（None=让模型自动估计）；说话人分离阶段据此重跑。
+    # 原视频实际人数与模型自动估计不一致时，指定后能强制分离出目标人数。
+    num_speakers: int | None = None
     # 最近一次擦除请求：{"speakers": [标签...], "output_dir": str | None}；
     # None 表示尚未发起擦除（分析完成后由用户经 API 发起）
     erase: dict | None = None
@@ -97,6 +100,7 @@ def snapshot(task: Task) -> dict:
         "id": task.id,
         "video_path": task.video_path,
         "audio_track": task.audio_track,
+        "num_speakers": task.num_speakers,
         "state": task.state.value,
         "state_label": STATE_LABELS[task.state],
         "error": task.error,

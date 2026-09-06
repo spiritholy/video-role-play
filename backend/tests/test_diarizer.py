@@ -6,9 +6,14 @@
 """
 
 from dataclasses import dataclass
+import os
+import sys
+import types
 from pathlib import Path
 
 import pytest
+
+from huggingface_hub.constants import HF_HUB_CACHE
 
 from app.inference import PyannoteDiarizer, SpeakerSegment, _PyannoteProgress
 from app.media import TaskError
@@ -17,6 +22,28 @@ from app.media import TaskError
 def clear_hf_token(monkeypatch) -> None:
     monkeypatch.delenv("HF_TOKEN", raising=False)
     monkeypatch.delenv("HUGGINGFACE_TOKEN", raising=False)
+
+
+def test_生产加载指向HF缓存而不是pyannote默认缓存(monkeypatch):
+    monkeypatch.setenv("HF_TOKEN", "hf_ok")
+    calls = []
+
+    def fake_from_pretrained(model_id, use_auth_token=None, cache_dir=None):
+        calls.append((model_id, use_auth_token, cache_dir))
+        return object()
+
+    fake_module = types.ModuleType("pyannote.audio")
+    fake_module.Pipeline = type(
+        "FakePipeline", (), {"from_pretrained": staticmethod(fake_from_pretrained)}
+    )
+    monkeypatch.setitem(sys.modules, "pyannote.audio", fake_module)
+    PyannoteDiarizer._create_pipeline("pyannote/speaker-diarization-3.1", "hf_ok")
+    assert len(calls) == 1
+    model_id, token, cache_dir = calls[0]
+    assert model_id == "pyannote/speaker-diarization-3.1"
+    assert token == "hf_ok"
+    assert cache_dir == HF_HUB_CACHE, "缓存目录必须与 huggingface_hub 默认缓存一致"
+    assert os.environ.get("PYANNOTE_CACHE") == HF_HUB_CACHE
 
 
 def test_token未配置时给出配置指引(monkeypatch):
@@ -139,6 +166,37 @@ def test_说话人时段映射为结构化数据并按时间排序(monkeypatch):
         SpeakerSegment("SPEAKER_01", 0.2, 0.9),
         SpeakerSegment("SPEAKER_00", 1.3, 1.8),
     )
+
+
+class _FakeParamPipeline:
+    """带参数的假 pyannote 管线：记录 instantiate/调用参数。"""
+
+    def __init__(self):
+        self.instantiated: list[dict] = []
+        self.calls: list[dict] = []
+
+    def parameters(self, instantiated=False):
+        assert instantiated is True
+        return {"clustering": {"min_cluster_size": 12}}
+
+    def instantiate(self, params):
+        self.instantiated.append(params)
+
+    def __call__(self, file, hook=None, **kwargs):
+        self.calls.append(kwargs)
+        return _FakeAnnotation()
+
+
+def test_指定说话人数量透传管线并还原聚类参数(monkeypatch):
+    monkeypatch.setenv("HF_TOKEN", "hf_ok")
+    pipe = _FakeParamPipeline()
+    d = PyannoteDiarizer(pipeline_factory=lambda token: pipe)
+    d.diarize(Path("任意.wav"), Path("."), lambda f: None, num_speakers=4)
+    assert pipe.calls == [{"num_speakers": 4}], "指定的说话人数量应透传给管线"
+    assert pipe.instantiated == [
+        {"clustering": {"min_cluster_size": 3}},  # 强制人数时调低 min_cluster_size
+        {"clustering": {"min_cluster_size": 12}},  # 用完还原，不污染跨任务共享管线
+    ]
 
 
 def test_pyannote进度折算单调且到达1():

@@ -191,10 +191,11 @@ def _resume_manifest(task, ws: Path, src: Path) -> dict:
     """
     manifest = workspace.read_manifest(ws)
     if workspace.is_for_source(manifest, task.video_path, task.audio_track):
-        _adopt_chain(
-            task, manifest, workspace.ANALYSIS_STAGES,
-            workspace.done_stages(ws, manifest),
-        )
+        done = workspace.done_stages(ws, manifest)
+        if _requested_speaker_count(manifest) != task.num_speakers:
+            # 说话人数量变了：旧说话人时段及其样本台词不再对应，重算
+            done.discard("diarize")
+        _adopt_chain(task, manifest, workspace.ANALYSIS_STAGES, done)
         if not workspace.analysis_reusable(ws, manifest):
             # 分析链断过：旧分析合成的擦除混音不再对应，一并作废
             _reset_stages(task, manifest, ("mask_erase", "encode_mux"))
@@ -376,7 +377,9 @@ def _stage_diarize(
         _check_cancelled(ctx.cancel_event)
 
     try:
-        diarization = ctx.inference.diarizer.diarize(wav, out_dir, on_progress)
+        diarization = ctx.inference.diarizer.diarize(
+            wav, out_dir, on_progress, num_speakers=task.num_speakers
+        )
     except (TaskCancelled, TaskError):
         raise
     except Exception as e:
@@ -391,6 +394,7 @@ def _stage_diarize(
     data = {
         "version": 1,
         "model": ctx.inference.diarizer.name,
+        "requested_num_speakers": task.num_speakers,
         "num_speakers": len(speakers),
         "segments": [
             {"speaker": s.speaker, "start": s.start, "end": s.end}
@@ -407,6 +411,7 @@ def _stage_diarize(
     stage.progress = 1.0
     manifest["diarization"] = {
         "model": ctx.inference.diarizer.name,
+        "requested_num_speakers": task.num_speakers,
         "num_speakers": len(speakers),
         "segments": rel,
     }
@@ -485,6 +490,18 @@ def _read_diarization_segments(ws: Path) -> list[dict]:
     except (OSError, json.JSONDecodeError) as e:
         raise TaskError("说话人分离产物缺失或损坏，无法擦除") from e
     return list(data.get("segments", []))
+
+
+def _requested_speaker_count(manifest: dict) -> int | None:
+    """清单里上次说话人分离请求的说话人数量（None=自动估计）。
+
+    旧版清单没有该字段，按自动估计处理；用户重新指定人数后据此让
+    说话人时段失效重算，而不是静默复用旧结果。
+    """
+    diarization = (manifest or {}).get("diarization")
+    if not isinstance(diarization, dict):
+        return None
+    return diarization.get("requested_num_speakers")
 
 
 def _load_diarization(ws: Path) -> DiarizationResult:

@@ -28,3 +28,16 @@ def test_解码失败时任务失败并给出原因(client, tmp_path):
     done = get_task(client, task["id"])
     assert done["error"], "失败任务必须带原因"
     assert done["output_path"] is None
+
+
+def test_说话人数量越界时提交被拒(client):
+    for bad in (0, -1, 21, 100):
+        resp = client.post(
+            "/api/tasks", json={"video_path": "/tmp/x.mp4", "num_speakers": bad}
+        )
+        assert resp.status_code == 422, f"num_speakers={bad} 应被校验拒绝"
+
+    resp = client.post(
+        "/api/tasks", json={"video_path": "/tmp/x.mp4", "num_speakers": "abc"}
+    )
+    assert resp.status_code == 422, "非整数说话人数量应被校验拒绝"

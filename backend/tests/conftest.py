@@ -182,9 +182,12 @@ class CannedDiarizer:
         self.fail = fail
         self.gate = gate
         self.calls: list[Path] = []
+        self.num_speakers: list[int | None] = []
 
-    def diarize(self, wav: Path, out_dir: Path, on_progress) -> DiarizationResult:
+    def diarize(self, wav: Path, out_dir: Path, on_progress,
+                num_speakers: int | None = None) -> DiarizationResult:
         self.calls.append(Path(wav))
+        self.num_speakers.append(num_speakers)
         if self.fail is not None:
             raise self.fail
         on_progress(0.5)
@@ -277,10 +280,13 @@ class ToneStemsSeparator:
         return SeparationStems(vocal=vocal, accompaniment=accomp)
 
 
-def submit_task(client: TestClient, video: Path, audio_track: int | None = None) -> dict:
+def submit_task(client: TestClient, video: Path, audio_track: int | None = None,
+                num_speakers: int | None = None) -> dict:
     body = {"video_path": str(video)}
     if audio_track is not None:
         body["audio_track"] = audio_track
+    if num_speakers is not None:
+        body["num_speakers"] = num_speakers
     resp = client.post("/api/tasks", json=body)
     assert resp.status_code == 200, resp.text
     return resp.json()
@@ -294,9 +300,10 @@ def erase(client: TestClient, task_id: str, speakers: list[str],
     return client.post(f"/api/tasks/{task_id}/erase", json=body)
 
 
-def run_to_analysis(client: TestClient, video: Path, audio_track: int | None = None) -> dict:
+def run_to_analysis(client: TestClient, video: Path, audio_track: int | None = None,
+                   num_speakers: int | None = None) -> dict:
     """提交任务并等待分析阶段（音轨提取→样本转写）完成。"""
-    task = submit_task(client, video, audio_track)
+    task = submit_task(client, video, audio_track, num_speakers)
     wait_for(lambda: get_task(client, task["id"])["state"] == "completed")
     return get_task(client, task["id"])
 

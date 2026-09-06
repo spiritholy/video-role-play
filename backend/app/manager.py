@@ -56,11 +56,17 @@ class TaskManager:
         if self._thread.is_alive():
             self._thread.join(timeout=10)
 
-    def submit(self, video_path: str, audio_track: int | None = None) -> Task:
+    def submit(
+        self,
+        video_path: str,
+        audio_track: int | None = None,
+        num_speakers: int | None = None,
+    ) -> Task:
         task = Task(
             id=uuid.uuid4().hex[:12],
             video_path=str(video_path),
             audio_track=audio_track,
+            num_speakers=num_speakers,
         )
         with self._lock:
             self._tasks[task.id] = task

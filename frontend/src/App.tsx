@@ -173,6 +173,7 @@ export default function App() {
   const [videoPath, setVideoPath] = useState("");
   const [probe, setProbe] = useState<ProbeResult | null>(null);
   const [selectedTrack, setSelectedTrack] = useState(0);
+  const [numSpeakers, setNumSpeakers] = useState("");  // 空=让模型自动估计
   const [formError, setFormError] = useState<string | null>(null);
   const [probing, setProbing] = useState(false);
 
@@ -344,6 +345,7 @@ export default function App() {
         body: JSON.stringify({
           video_path: videoPath.trim(),
           audio_track: probe && probe.tracks.length > 0 ? selectedTrack : null,
+          num_speakers: numSpeakers.trim() ? Number(numSpeakers.trim()) : null,
         }),
       });
       const data = await resp.json();
@@ -492,6 +494,19 @@ export default function App() {
             </select>
           </div>
         )}
+
+        <label htmlFor="num-speakers">
+          说话人数量（可选，留空=自动估计；原片人数与自动结果不符时在此指定）
+        </label>
+        <input
+          id="num-speakers"
+          type="number"
+          min={1}
+          max={20}
+          placeholder="如 4"
+          value={numSpeakers}
+          onChange={(e) => setNumSpeakers(e.target.value)}
+        />
 
         {formError && <p className="error-text">{formError}</p>}
 

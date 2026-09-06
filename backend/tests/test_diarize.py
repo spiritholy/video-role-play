@@ -6,6 +6,7 @@
 
 import json
 import threading
+from pathlib import Path
 
 from app.media import TaskError
 from conftest import (
@@ -47,6 +48,7 @@ def test_完成后工作区存在说话人时段产物且清单更新(client, tm
     assert [s["status"] for s in manifest["stages"]] == ["done"] * 4 + ["pending"] * 2  # 分析完成；掩码合成/编码封装待擦除触发
     assert manifest["diarization"] == {
         "model": "canned-diarizer",
+        "requested_num_speakers": None,
         "num_speakers": 2,
         "segments": DIARIZATION,
     }
@@ -215,3 +217,24 @@ def test_取消运行中的说话人分离阶段(tmp_path):
         done = get_task(client, task["id"])
         assert diarize_stage(done)["status"] == "cancelled"
         assert done["output_path"] is None
+
+
+def test_指定说话人数量透传分离器并写入产物与清单(tmp_path):
+    diarizer = CannedDiarizer()
+    video = make_video(tmp_path, "指定人数.mp4")
+
+    with make_client(tmp_path, diarizer=diarizer) as client:
+        task = submit_task(client, video, num_speakers=4)
+        wait_for(lambda: get_task(client, task["id"])["state"] == "completed")
+        done = get_task(client, task["id"])
+        assert done["num_speakers"] == 4, "任务快照应暴露用户指定的说话人数量"
+        assert diarizer.num_speakers == [4], "指定人数应透传给说话人分离器"
+
+        data = json.loads(
+            (Path(done["workspace_dir"]) / DIARIZATION).read_text(encoding="utf-8")
+        )
+        assert data["requested_num_speakers"] == 4, "产物应记录请求人数"
+        manifest = json.loads(
+            (Path(done["workspace_dir"]) / "manifest.json").read_text(encoding="utf-8")
+        )
+        assert manifest["diarization"]["requested_num_speakers"] == 4

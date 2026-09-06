@@ -18,6 +18,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Protocol
 
+from huggingface_hub.constants import HF_HUB_CACHE
 from huggingface_hub.errors import (
     GatedRepoError,
     RepositoryNotFoundError,
@@ -80,7 +81,11 @@ class SpeakerDiarizer(Protocol):
     name: str
 
     def diarize(
-        self, wav: Path, out_dir: Path, on_progress: ProgressCallback
+        self,
+        wav: Path,
+        out_dir: Path,
+        on_progress: ProgressCallback,
+        num_speakers: int | None = None,
     ) -> DiarizationResult: ...
 
 
@@ -250,12 +255,18 @@ class _PyannoteProgress:
         self._on_progress(overall)
 
 
+# 用户指定说话人数量时使用的聚类最小簇大小：默认 12 会吞掉短时段说话人，
+# 导致指定人数无法物化（本仓库实测 64 秒片段强制 4 人时 pyannote 提示应调低）。
+_FORCED_COUNT_MIN_CLUSTER_SIZE = 3
+
+
 class PyannoteDiarizer:
     """pyannote.audio 3.1 speaker-diarization（CPU），第二个接入推理接口的模型。
 
     门控模型：首次使用需 HF token（HF_TOKEN / HUGGINGFACE_TOKEN）并在线接受
-    模型协议，权重下载后完全离线。说话人数量全自动估计——刻意不传任何
-    人数提示参数（不确定人数时乱填反而干扰估计，spec #1 用户决策）。
+    模型协议，权重下载后完全离线。说话人数量默认全自动估计；用户指定
+    num_speakers 时强制分离出目标人数（pyannote 官方对短片段自动估计偏少
+    的推荐做法，spec #1 用户决策：知道人数就填，不知道就交给自动估计）。
     """
 
     name = "pyannote/speaker-diarization-3.1"
@@ -290,17 +301,41 @@ class PyannoteDiarizer:
         return self._pipeline
 
     def diarize(
-        self, wav: Path, out_dir: Path, on_progress: ProgressCallback
+        self,
+        wav: Path,
+        out_dir: Path,
+        on_progress: ProgressCallback,
+        num_speakers: int | None = None,
     ) -> DiarizationResult:
         pipeline = self.load_model()
+        kwargs: dict = {}
+        restore_mcs: int | None = None
+        if num_speakers is not None:
+            kwargs["num_speakers"] = num_speakers
+            # pyannote 默认聚类 min_cluster_size=12：说话总时长不足的说话人
+            # 会被并进他人簇，导致用户指定的人数兑现不出来（pyannote 官方
+            # 警告也提示"应降低 min_cluster_size"）。指定人数时临时调低让
+            # 目标人数物化；用完还原，避免污染跨任务共享的缓存管线实例。
+            current = pipeline.parameters(instantiated=True)
+            restore_mcs = current["clustering"]["min_cluster_size"]
+            pipeline.instantiate(
+                {"clustering": {"min_cluster_size": _FORCED_COUNT_MIN_CLUSTER_SIZE}}
+            )
         try:
-            annotation = pipeline(str(wav), hook=_PyannoteProgress(on_progress))
+            annotation = pipeline(
+                str(wav), hook=_PyannoteProgress(on_progress), **kwargs
+            )
         except TaskCancelled:
             raise
         except TaskError:
             raise
         except Exception as e:
             raise TaskError(f"pyannote 说话人分离推理失败: {e}") from e
+        finally:
+            if restore_mcs is not None:
+                pipeline.instantiate(
+                    {"clustering": {"min_cluster_size": restore_mcs}}
+                )
         segments = [
             SpeakerSegment(speaker=label, start=seg.start, end=seg.end)
             for seg, _, label in annotation.itertracks(yield_label=True)
@@ -310,13 +345,21 @@ class PyannoteDiarizer:
 
     @staticmethod
     def _create_pipeline(model_id: str, token: str):
+        # pyannote 3.1 的默认缓存目录是 ~/.cache/torch/pyannote，
+        # 与 huggingface_hub 的默认缓存（~/.cache/huggingface/hub）不一致；
+        # 必须在本方法内首次 import pyannote.audio 之前设好 PYANNOTE_CACHE，
+        # 否则子模型仍会落到 torch/pyannote 缓存、本地权重不被命中而反复联网。
+        cache_dir = os.environ.get("PYANNOTE_CACHE") or HF_HUB_CACHE
+        os.environ["PYANNOTE_CACHE"] = cache_dir
         try:
             from pyannote.audio import Pipeline
         except ImportError as e:
             raise TaskError(
                 "缺少依赖 pyannote.audio：请先安装 backend/requirements.txt"
             ) from e
-        return Pipeline.from_pretrained(model_id, use_auth_token=token)
+        return Pipeline.from_pretrained(
+            model_id, use_auth_token=token, cache_dir=cache_dir
+        )
 
 
 # Whisper 内部统一的工作采样率（decode_audio 的重采样目标）

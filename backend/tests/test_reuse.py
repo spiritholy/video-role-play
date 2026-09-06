@@ -205,3 +205,40 @@ def test_换目标再次擦除重做掩码合成(client, tmp_path):
 
     assert mix.stat().st_mtime_ns != before, "目标变了必须重做掩码合成"
     assert second["output_path"] == str(video.with_name("换目标__erased-SPEAKER_01.mp4"))
+
+
+def test_改变说话人数量只重算说话人分离与样本转写(tmp_path):
+    separator, diarizer, transcriber = CannedSeparator(), CannedDiarizer(), CannedTranscriber()
+    video = make_video(tmp_path, "改人数.mp4")
+
+    with make_client(
+        tmp_path, separator=separator, diarizer=diarizer, transcriber=transcriber
+    ) as client:
+        first = run_to_analysis(client, video)  # 自动估计
+        assert call_counts(separator, diarizer, transcriber) == (1, 1, 1)
+        assert diarizer.num_speakers == [None]
+
+        second = run_to_analysis(client, video, num_speakers=4)
+        assert call_counts(separator, diarizer, transcriber) == (1, 2, 2), (
+            "说话人数量变了只重算说话人分离与样本转写，昂贵的分离与音轨提取不复算"
+        )
+        assert diarizer.num_speakers == [None, 4]
+        assert statuses(second) == ANALYSIS_STATUSES
+        assert manifest_of(second)["diarization"]["requested_num_speakers"] == 4
+
+
+def test_相同说话人数量再次提交复用分析产物(tmp_path):
+    separator, diarizer, transcriber = CannedSeparator(), CannedDiarizer(), CannedTranscriber()
+    video = make_video(tmp_path, "同人数.mp4")
+
+    with make_client(
+        tmp_path, separator=separator, diarizer=diarizer, transcriber=transcriber
+    ) as client:
+        first = run_to_analysis(client, video, num_speakers=4)
+        assert call_counts(separator, diarizer, transcriber) == (1, 1, 1)
+
+        second = run_to_analysis(client, video, num_speakers=4)
+        assert call_counts(separator, diarizer, transcriber) == (1, 1, 1), (
+            "相同说话人数量不是新的分析，应直接复用工作区产物"
+        )
+        assert statuses(second) == ANALYSIS_STATUSES

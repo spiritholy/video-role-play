@@ -41,6 +41,10 @@ def _stage_of(task, stage_id: str):
 class TaskSubmitIn(BaseModel):
     video_path: str = Field(min_length=1)
     audio_track: int | None = None
+    # 说话人数量：None=模型自动估计；1..20=强制分离出指定人数。
+    # 自动估计在短片段上容易偏少（如 4 人只出 2 人），知道原片人数时
+    # 指定后能强制物化出目标人数。
+    num_speakers: int | None = Field(default=None, ge=1, le=20)
 
 
 class ProbeIn(BaseModel):
@@ -98,7 +102,9 @@ def create_app(
 
     @app.post("/api/tasks")
     def create_task(body: TaskSubmitIn):
-        task = manager.submit(body.video_path, body.audio_track)
+        task = manager.submit(
+            body.video_path, body.audio_track, num_speakers=body.num_speakers
+        )
         return snapshot(task)
 
     @app.get("/api/tasks")
