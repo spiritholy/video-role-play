@@ -5,3 +5,8 @@ __pycache__/
 *.pyc
 .pytest_cache/
 workspaces/
+
+# 本地环境变量（实体不提交，模板提交）
+.env
+.env.*
+!.env.example

@@ -25,4 +25,17 @@ if [ ! -f frontend/dist/index.html ]; then
   (cd frontend && npm run build)
 fi
 
+# HF token 预检：pyannote 是门控模型，缺 token 会白跑几小时才撞上失败。
+# 只提醒不拦停（run.py 会重复一次更权威的判断，--env-file 自定义路径时以它为准）。
+has_env_token() { [ -n "${HF_TOKEN:-}" ] || [ -n "${HUGGINGFACE_TOKEN:-}" ]; }
+has_file_token() {
+  [ -f .env ] && grep -Eq \
+    '^[[:space:]]*(export[[:space:]]+)?(HF_TOKEN|HUGGINGFACE_TOKEN)[[:space:]]*=[[:space:]]*[^[:space:]]' .env
+}
+if ! has_env_token && ! has_file_token; then
+  echo "[warn] 未找到 HF token（进程环境与环境变量文件都没有）"
+  echo "[warn] 建议：cp .env.example .env && chmod 600 .env，再把 token 填进 .env"
+  echo "[warn] 现在仍能启动并使用到「人声/伴奏分离」，之后会在「说话人分离」失败。"
+fi
+
 exec "$VENV_PY" run.py "$@"

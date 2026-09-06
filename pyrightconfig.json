@@ -1,0 +1,9 @@
+{
+  "include": ["run.py", "backend"],
+  "exclude": ["**/.*", "**/node_modules", "**/__pycache__", "**/dist", "workspaces"],
+  "typeCheckingMode": "off",
+  "extraPaths": ["backend", "backend/tests"],
+  "venvPath": "backend",
+  "venv": ".venv",
+  "pythonVersion": "3.10"
+}
