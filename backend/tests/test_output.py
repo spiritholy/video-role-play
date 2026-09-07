@@ -103,4 +103,8 @@ def test_mkv源的字幕轨在容器允许时一并复制(client, tmp_path):
     info = probe(done["output_path"])
     subtitles = [s for s in info["streams"] if s["codec_type"] == "subtitle"]
     assert subtitles, "容器允许时字幕流应随视频流一并复制"
+    src_subs = [s for s in probe(video)["streams"] if s["codec_type"] == "subtitle"]
+    assert [s["codec_name"] for s in subtitles] == [s["codec_name"] for s in src_subs], (
+        "字幕应原样复制而非被 ffmpeg 重编码"
+    )
     assert_audio_aac_256k_stereo(done["output_path"])

@@ -625,6 +625,7 @@ def _mux_args(src: Path, mix: Path, tmp: Path, ext: str, full_streams: bool) -> 
         args += ["-map", "0:v:0", "-map", "1:a:0"]
     args += [
         "-c:v", "copy",
+        "-c:s", "copy",
         "-c:a", "aac", "-b:a", "256k",
         "-ar", str(PCM_SAMPLE_RATE),
         "-ac", "2",
