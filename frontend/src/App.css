@@ -204,6 +204,25 @@ button.resume {
   border-radius: 4px;
   font-size: 12px;
   border: 1px solid transparent;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.stage-progress {
+  width: 44px;
+  height: 4px;
+  overflow: hidden;
+  border-radius: 999px;
+  background: rgb(201 111 0 / 20%);
+}
+
+.stage-progress-fill {
+  display: block;
+  height: 100%;
+  border-radius: inherit;
+  background: #c96f00;
+  transition: width 0.25s ease;
 }
 
 .chip-pending {

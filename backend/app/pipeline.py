@@ -290,6 +290,7 @@ def _stage_audio_extract(task, ctx: RunContext, ws: Path, manifest: dict) -> Pat
             f"音轨序号 {task.audio_track} 超出范围（共 {len(audio)} 条音轨）"
         )
     stream = audio[track_no]
+    source_duration = float((info.get("format") or {}).get("duration") or 0)
 
     out_dir = ws / "01-audio-extract"
     out_dir.mkdir(exist_ok=True)
@@ -305,6 +306,8 @@ def _stage_audio_extract(task, ctx: RunContext, ws: Path, manifest: dict) -> Pat
             str(wav),
         ],
         ctx.cancel_event,
+        on_progress=lambda fraction: setattr(stage, "progress", fraction),
+        total_seconds=source_duration,
     )
     artifact = str(wav.relative_to(ws))
     stage.artifacts.append(artifact)
@@ -601,6 +604,8 @@ def _stage_mask_erase(
             str(mix),
         ],
         ctx.cancel_event,
+        on_progress=lambda fraction: setattr(stage, "progress", fraction),
+        total_seconds=_wav_duration(vocal),
     )
     rel = str(mix.relative_to(ws))
     stage.artifacts.append(rel)
@@ -638,15 +643,26 @@ def _stage_encode_mux(
     out = erased_output_path(src, targets, names, (task.erase or {}).get("output_dir"))
     out.parent.mkdir(parents=True, exist_ok=True)
     tmp = out.with_name(out.name + f".part-{os.getpid()}")
+    source_duration = _media_duration(src)
     full_streams = True
     try:
         try:
-            run_ffmpeg(_mux_args(src, mix, tmp, out.suffix, True), ctx.cancel_event)
+            run_ffmpeg(
+                _mux_args(src, mix, tmp, out.suffix, True),
+                ctx.cancel_event,
+                on_progress=lambda fraction: setattr(stage, "progress", fraction),
+                total_seconds=source_duration,
+            )
         except TaskError:
             # 容器装不下全部流（如 MP4 装 PGS 字幕）：回退到仅视频+音频复制
             full_streams = False
             tmp.unlink(missing_ok=True)
-            run_ffmpeg(_mux_args(src, mix, tmp, out.suffix, False), ctx.cancel_event)
+            run_ffmpeg(
+                _mux_args(src, mix, tmp, out.suffix, False),
+                ctx.cancel_event,
+                on_progress=lambda fraction: setattr(stage, "progress", fraction),
+                total_seconds=source_duration,
+            )
         os.replace(tmp, out)
     except BaseException:
         Path(tmp).unlink(missing_ok=True)
@@ -657,11 +673,20 @@ def _stage_encode_mux(
         "full_streams": full_streams,
     }
     task.output_path = str(out)
+    stage.progress = 1.0
     _end_stage(task, manifest, stage, StageStatus.DONE)
 
 
 def _stage(task, stage_id: str):
     return next(s for s in task.stages if s.id == stage_id)
+
+
+def _media_duration(path: Path) -> float:
+    """容器/媒体时长（秒）；读取失败按 0 处理，仅影响进度折算。"""
+    try:
+        return float((ffprobe_json(path).get("format") or {}).get("duration") or 0)
+    except TaskError:
+        return 0.0
 
 
 def _entry(manifest: dict, stage_id: str) -> dict:

@@ -587,8 +587,20 @@ export default function App() {
                   {t.stages.map((s) => (
                     <span key={s.id} className={`chip chip-${s.status}`}>
                       {s.name}
-                      {s.status === "running" && s.progress != null &&
-                        ` ${Math.round(s.progress * 100)}%`}
+                      {s.status === "running" && (
+                        <span
+                          className="stage-progress"
+                          role="progressbar"
+                          aria-valuemin={0}
+                          aria-valuemax={100}
+                          aria-valuenow={s.progress == null ? undefined : Math.round(s.progress * 100)}
+                        >
+                          <span
+                            className="stage-progress-fill"
+                            style={{ width: `${Math.round((s.progress ?? 0) * 100)}%` }}
+                          />
+                        </span>
+                      )}
                     </span>
                   ))}
                 </span>
