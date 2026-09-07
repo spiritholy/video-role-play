@@ -12,6 +12,7 @@ from .inference import (
     DemucsSeparator,
     Inference,
     PyannoteDiarizer,
+    PyannoteEmbedder,
     WhisperTranscriber,
 )
 from .models import Task, TaskState, now_iso
@@ -33,10 +34,11 @@ class TaskNotResumable(Exception):
 class TaskManager:
     def __init__(self, workspace_root: Path, inference: Inference | None = None):
         self._workspace_root = Path(workspace_root)
-        self._inference = inference or Inference(
+        self.inference = inference or Inference(
             separator=DemucsSeparator(),
             diarizer=PyannoteDiarizer(),
             transcriber=WhisperTranscriber(),
+            embedder=PyannoteEmbedder(),
         )
         self._tasks: dict[str, Task] = {}
         self._queue: deque[str] = deque()
@@ -229,7 +231,7 @@ class TaskManager:
             ctx = RunContext(
                 workspace_root=self._workspace_root,
                 cancel_event=task.cancel_event,
-                inference=self._inference,
+                inference=self.inference,
             )
             if task.erase:
                 # 管线对取消事件做阶段边界与子进程内的检查：正常返回即完成

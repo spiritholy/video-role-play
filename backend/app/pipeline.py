@@ -24,11 +24,16 @@ from pathlib import Path
 import threading
 from typing import Iterable
 
-from . import workspace
+from . import recognition, voiceprints, workspace
 from .inference import DiarizationResult, Inference, SeparationStems, SpeakerSegment
 from .media import TaskCancelled, TaskError, audio_tracks, ffprobe_json, run_ffmpeg
-from .models import StageStatus, now_iso
+from .models import STAGE_DEFS, StageStatus, now_iso
 from .samples import select_samples
+from .recognition import (
+    RecognitionResult,
+    apply_recognition,
+    plan_embeddings,
+)
 
 # 官方支持 AAC 的容器；其余（如 WebM）落到 MKV
 AAC_CONTAINERS = {".mp4", ".m4v", ".mov", ".mkv"}
@@ -41,6 +46,10 @@ WORKSPACE_FACTOR = 5
 
 DIARIZATION_DIR = "03-diarize"
 DIARIZATION_FILENAME = "diarization.json"
+# 认人/纠错阶段（spec #9）：位于 说话人分离 与 样本转写 之间。目录名带
+# 后缀避免重排既有 01–06 目录（升级前工作区的产物路径不能变）。
+RECOGNIZE_DIR = "03b-recognize"
+RECOGNITION_FILENAME = "recognition.json"
 TRANSCRIBE_DIR = "04-transcribe"
 TRANSCRIPTION_FILENAME = "transcripts.json"
 MASK_ERASE_DIR = "05-mask-erase"
@@ -87,14 +96,19 @@ def run_analysis(task, ctx: RunContext) -> None:
     ensure_disk_space(src, ctx.workspace_root)
     ws = workspace.prepare(ctx.workspace_root, task.video_path)
     task.workspace_dir = str(ws)
-    manifest = _resume_manifest(task, ws, src)
+    library = voiceprints.read_library(ctx.workspace_root)
+    embedder_name = ctx.inference.embedder.name
+    manifest = _resume_manifest(task, ws, src, library, embedder_name)
     _check_cancelled(ctx.cancel_event)
 
     def stages():
         wav = _stage_audio_extract(task, ctx, ws, manifest)
         _stage_separate(task, ctx, ws, manifest, wav)
         diarization = _stage_diarize(task, ctx, ws, manifest, wav)
-        _stage_transcribe(task, ctx, ws, manifest, wav, diarization)
+        recognition_result = _stage_recognize(
+            task, ctx, ws, manifest, wav, diarization, library, embedder_name
+        )
+        _stage_transcribe(task, ctx, ws, manifest, wav, recognition_result)
 
     _run_stages(task, manifest, stages)
 
@@ -186,18 +200,27 @@ def _new_manifest(task, src: Path) -> dict:
     }
 
 
-def _resume_manifest(task, ws: Path, src: Path) -> dict:
+def _resume_manifest(
+    task, ws: Path, src: Path, library: dict, embedder_name: str
+) -> dict:
     """接续工作区清单：同一份分析则采纳已完成阶段，否则新起一份。
 
     清单不可用（首次处理、换了音轨、源视频变了、工作区被删）时把任务的
     全部阶段复位：任务内存里可能还记着上一轮的"已完成"，而产物已经不在了。
+    升级前的工作区清单没有认人/纠错条目：按待运行物化，保证重开不崩。
     """
     manifest = workspace.read_manifest(ws)
     if workspace.is_for_source(manifest, task.video_path, task.audio_track):
+        workspace.ensure_stage_entries(manifest, STAGE_DEFS)
         done = workspace.done_stages(ws, manifest)
         if _requested_speaker_count(manifest) != task.num_speakers:
             # 说话人数量变了：旧说话人时段及其样本台词不再对应，重算
             done.discard("diarize")
+        if _recognition_stale(ws, library, embedder_name):
+            # 声纹库 revision/模型变了：认人/纠错产物失效。_adopt_chain 会
+            # 把它与样本转写一并重做（转写基于修正后时段），昂贵的说话人
+            # 分离与音源分离不动——这就是"改库后重开只重跑认人/纠错与转写"。
+            done.discard("recognize")
         _adopt_chain(task, manifest, workspace.ANALYSIS_STAGES, done)
         if not workspace.analysis_reusable(ws, manifest):
             # 分析链断过：旧分析合成的擦除混音不再对应，一并作废
@@ -425,13 +448,162 @@ def _stage_diarize(
     return diarization
 
 
-def _stage_transcribe(
+def _stage_recognize(
     task,
     ctx: RunContext,
     ws: Path,
     manifest: dict,
     wav: Path,
     diarization: DiarizationResult,
+    library: dict,
+    embedder_name: str,
+) -> RecognitionResult:
+    """认人/纠错：用声纹库给说话人自动命名、合并同人簇、纠正标错段。
+
+    无声纹库（或模型不匹配，条目视为不存在）时恒等通过：不抽声纹、
+    不改时段，与现状完全一致。产物记录当时的库 revision 与模型——库
+    变了之后重开工作区，只重跑本阶段与样本转写。
+    """
+    stage = _stage(task, "recognize")
+    if stage.status == StageStatus.DONE:
+        return _load_recognition(ws)  # 复用工作区里的认人结果
+    stage = _begin_stage(task, manifest, "recognize")
+    revision = int(library.get("revision") or 0)
+    effective = voiceprints.effective_entries(library, embedder_name)
+    segments = list(diarization.segments)
+    if not effective:
+        result = RecognitionResult(
+            mapping={},
+            segments=tuple(segments),
+            library_revision=revision,
+            used_library=False,
+        )
+    else:
+        plan = plan_embeddings(segments)
+        windows = _unique_windows(plan)
+
+        def on_progress(fraction: float) -> None:
+            stage.progress = max(0.0, min(1.0, float(fraction)))
+            _check_cancelled(ctx.cancel_event)
+
+        try:
+            vectors = ctx.inference.embedder.embed(
+                _vocal_track(ws, manifest), windows, on_progress
+            )
+        except (TaskCancelled, TaskError):
+            raise
+        except Exception as e:
+            raise TaskError(f"认人/纠错失败: {e}") from e
+        vectors_by_window = dict(zip(windows, vectors))
+        name_vectors = {
+            name: entry["vectors"] for name, entry in effective.items()
+        }
+        result = apply_recognition(
+            segments, plan, vectors_by_window, name_vectors, revision
+        )
+    data = {
+        "version": 1,
+        "model": embedder_name,
+        "revision": revision,
+        "used_library": result.used_library,
+        "mapping": dict(result.mapping),
+        "segments": [
+            {"speaker": s.speaker, "start": s.start, "end": s.end}
+            for s in result.segments
+        ],
+    }
+    out_dir = ws / RECOGNIZE_DIR
+    out_dir.mkdir(exist_ok=True)
+    artifact = out_dir / RECOGNITION_FILENAME
+    artifact.write_text(
+        json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8"
+    )
+    rel = str(artifact.relative_to(ws))
+    stage.artifacts.append(rel)
+    stage.outputs = {"recognition": rel}
+    stage.progress = 1.0
+    manifest["recognition"] = {
+        "revision": revision,
+        "model": embedder_name,
+        "recognition": rel,
+    }
+    _end_stage(task, manifest, stage, StageStatus.DONE)
+    return result
+
+
+def _unique_windows(plan) -> list[tuple[float, float]]:
+    """抽声纹窗口去重（保序）：簇级与逐段验证可能命中同一窗口，避免重复推理。"""
+    seen: set[tuple[float, float]] = set()
+    out: list[tuple[float, float]] = []
+    for _label, window in plan.cluster_windows:
+        if window not in seen:
+            seen.add(window)
+            out.append(window)
+    for _index, window in plan.verify_windows:
+        if window not in seen:
+            seen.add(window)
+            out.append(window)
+    return out
+
+
+def _vocal_track(ws: Path, manifest: dict) -> Path:
+    """人声轨产物路径（抽声纹一律使用人声轨，避开背景音乐污染）。"""
+    separation = manifest.get("separation") or {}
+    rel = separation.get("vocal")
+    if not rel:
+        raise TaskError("工作区缺少人声轨产物，无法认人")
+    vocal = ws / rel
+    if not vocal.is_file():
+        raise TaskError("人声轨产物文件缺失，无法认人")
+    return vocal
+
+
+def _load_recognition(ws: Path) -> RecognitionResult:
+    """把工作区里的认人产物读回结构化结果（复用/续跑用）。"""
+    path = ws / RECOGNIZE_DIR / RECOGNITION_FILENAME
+    data = json.loads(path.read_text(encoding="utf-8"))
+    return RecognitionResult(
+        mapping={
+            str(k): str(v)
+            for k, v in (data.get("mapping") or {}).items()
+        },
+        segments=tuple(
+            SpeakerSegment(
+                str(s["speaker"]), float(s["start"]), float(s["end"])
+            )
+            for s in data.get("segments") or []
+        ),
+        library_revision=int(data.get("revision") or 0),
+        used_library=bool(data.get("used_library")),
+    )
+
+
+def _recognition_stale(ws: Path, library: dict, embedder_name: str) -> bool:
+    """认人/纠错产物是否失效：库 revision 或 embedder 模型与当时不一致。
+
+    没跑过（无产物）不算失效——阶段本就未完成，由调用方按待运行处理。
+    """
+    path = ws / RECOGNIZE_DIR / RECOGNITION_FILENAME
+    if not path.is_file():
+        return False
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError):
+        return True  # 产物损坏：视为失效，重跑
+    stored_rev = data.get("revision")
+    stored_rev = -1 if stored_rev is None else int(stored_rev)
+    current_rev = library.get("revision")
+    current_rev = 0 if current_rev is None else int(current_rev)
+    return stored_rev != current_rev or data.get("model") != embedder_name
+
+
+def _stage_transcribe(
+    task,
+    ctx: RunContext,
+    ws: Path,
+    manifest: dict,
+    wav: Path,
+    recognition_result: RecognitionResult,
 ) -> None:
     if _stage(task, "transcribe").status == StageStatus.DONE:
         return  # 复用工作区里的样本台词产物
@@ -439,7 +611,10 @@ def _stage_transcribe(
     out_dir = ws / TRANSCRIBE_DIR
     out_dir.mkdir(exist_ok=True)
 
-    samples = select_samples(list(diarization.segments), _wav_duration(wav))
+    # 样本段取自"修正后时段"（有认人结果用之，否则与原始说话人分离一致）
+    samples = select_samples(
+        list(recognition_result.segments), _wav_duration(wav)
+    )
 
     def on_progress(fraction: float) -> None:
         stage.progress = max(0.0, min(1.0, float(fraction)))
@@ -496,6 +671,28 @@ def _read_diarization_segments(ws: Path) -> list[dict]:
     except (OSError, json.JSONDecodeError) as e:
         raise TaskError("说话人分离产物缺失或损坏，无法擦除") from e
     return list(data.get("segments", []))
+
+
+def _read_recognition_segments(ws: Path) -> list[dict] | None:
+    """认人/纠错产物的修正后时段；无产物或损坏返回 None。"""
+    path = ws / RECOGNIZE_DIR / RECOGNITION_FILENAME
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    segments = data.get("segments")
+    return list(segments) if isinstance(segments, list) else None
+
+
+def _read_corrected_segments(ws: Path) -> list[dict]:
+    """修正后时段：有认人结果用之，否则回退原始说话人分离结果。
+
+    掩码合成与擦除校验统一读这里（spec #9 擦除语义）。
+    """
+    corrected = _read_recognition_segments(ws)
+    if corrected is not None:
+        return corrected
+    return _read_diarization_segments(ws)
 
 
 def _requested_speaker_count(manifest: dict) -> int | None:
@@ -583,7 +780,7 @@ def _stage_mask_erase(
     target_set = set(targets)
     intervals = union_intervals(
         (float(s["start"]), float(s["end"]))
-        for s in _read_diarization_segments(ws)
+        for s in _read_corrected_segments(ws)
         if s["speaker"] in target_set
     )
 

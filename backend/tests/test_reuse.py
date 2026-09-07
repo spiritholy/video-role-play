@@ -25,6 +25,7 @@ ANALYSIS_STATUSES = {
     "audio_extract": "done",
     "separate": "done",
     "diarize": "done",
+    "recognize": "done",
     "transcribe": "done",
     "mask_erase": "pending",
     "encode_mux": "pending",
@@ -99,7 +100,9 @@ def test_同源第二个任务继承命名并用于成品命名(tmp_path):
         )
 
         done = erase_to_completion(client, second["id"], ["SPEAKER_00"])
-        assert call_counts(separator, diarizer, transcriber) == (1, 1, 1)
+        # 命名即入库使库 revision 递增，认人产物失效：第二个任务只重跑
+        # 认人/纠错与样本转写，昂贵的音轨提取/分离/说话人分离仍零二次调用
+        assert call_counts(separator, diarizer, transcriber) == (1, 1, 2)
         assert done["output_path"] == str(video.with_name("继承__erased-男主.mp4")), (
             "继承的命名应可用于成品命名"
         )

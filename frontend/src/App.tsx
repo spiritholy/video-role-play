@@ -23,6 +23,7 @@ interface TimelineSegment {
 interface TimelineSpeaker {
   label: string;
   name: string | null;
+  auto?: boolean;  // 名字是否自动认出来的（手工命名优先，不标自动）
   speech_time: number;
   segments: TimelineSegment[];
 }
@@ -104,6 +105,7 @@ interface WorkspaceItem {
   size_bytes: number;
   size_label: string;
   reusable: boolean;
+  openable: boolean;
   resumable: boolean;
   busy: boolean;
 }
@@ -118,6 +120,19 @@ interface ProbeResult {
   container: string;
   duration: number;
   tracks: ProbeTrack[];
+}
+
+interface VoiceprintName {
+  name: string;
+  vectors_count: number;
+  source_workspace: string | null;
+  updated_at: string | null;
+}
+
+interface VoiceprintList {
+  revision: number;
+  model: string;
+  names: VoiceprintName[];
 }
 
 function trackLabel(t: ProbeTrack): string {
@@ -158,6 +173,8 @@ function workspaceKey(t: Task): string {
 export default function App() {
   const [tasks, setTasks] = useState<Task[]>([]);
   const [workspaces, setWorkspaces] = useState<WorkspaceList | null>(null);
+  const [voiceprints, setVoiceprints] = useState<VoiceprintList | null>(null);
+  const [voiceprintError, setVoiceprintError] = useState<string | null>(null);
   const [workspaceError, setWorkspaceError] = useState<string | null>(null);
   const [resumeError, setResumeError] = useState<string | null>(null);
   const [timelines, setTimelines] = useState<Record<string, TimelineOrError>>({});
@@ -192,10 +209,14 @@ export default function App() {
         const data: Timeline = await resp.json();
         setTimelines((prev) => ({ ...prev, [t.id]: data }));
         const wsKey = workspaceKey(t);
+        // 本地镜像只收手工命名：自动认出来的名字带 auto 标记，由时间轴接口
+        // 的 name/auto 直接展示，不冒充手工命名（否则「自动」徽标会丢失）
         setSpeakerNames((prev) => ({
           ...prev,
           [wsKey]: Object.fromEntries(
-            data.speakers.filter((s) => s.name).map((s) => [s.label, s.name as string]),
+            data.speakers
+              .filter((s) => s.name && !s.auto)
+              .map((s) => [s.label, s.name as string]),
           ),
         }));
       } catch {
@@ -267,6 +288,16 @@ export default function App() {
     }
   }, []);
 
+  const refreshVoiceprints = useCallback(async () => {
+    try {
+      const resp = await fetch("/api/voiceprints");
+      if (!resp.ok) return;
+      setVoiceprints(await resp.json());
+    } catch {
+      // 后端暂不可达时保留旧列表，下一轮重试
+    }
+  }, []);
+
   const refresh = useCallback(async () => {
     try {
       const resp = await fetch("/api/tasks");
@@ -278,7 +309,8 @@ export default function App() {
       // 后端暂不可达时保留旧列表，下一轮重试
     }
     refreshWorkspaces();
-  }, [maybeFetchTimeline, maybeFetchTranscripts, refreshWorkspaces]);
+    refreshVoiceprints();
+  }, [maybeFetchTimeline, maybeFetchTranscripts, refreshWorkspaces, refreshVoiceprints]);
 
   useEffect(() => {
     refresh();
@@ -440,6 +472,29 @@ export default function App() {
       return;
     }
     refresh();
+  }
+
+  async function handleDeleteVoiceprint(name: string) {
+    const confirmed = window.confirm(
+      `从声纹库删除「${name}」？\n\n后续剧集将不再自动识别该人物。`,
+    );
+    if (!confirmed) return;
+    setVoiceprintError(null);
+    try {
+      const resp = await fetch(
+        `/api/voiceprints/${encodeURIComponent(name)}`,
+        { method: "DELETE" },
+      );
+      if (!resp.ok) {
+        const data = await resp.json().catch(() => null);
+        setVoiceprintError(data?.detail ?? "删除声纹失败");
+        return;
+      }
+    } catch {
+      setVoiceprintError("无法连接后端服务");
+      return;
+    }
+    refreshVoiceprints();
   }
 
   function renderTimeline(t: Task) {
@@ -641,6 +696,41 @@ export default function App() {
       <section className="workspaces">
         <h2>工作区{workspaces ? `（共占用 ${workspaces.total_label}）` : ""}</h2>
         {workspaceError && <p className="error-text">{workspaceError}</p>}
+
+        <div className="voiceprint-panel">
+          <div className="voiceprint-title">
+            人物声纹库
+            {voiceprints && voiceprints.names.length > 0 && (
+              <span className="voiceprint-meta">
+                已积累 {voiceprints.names.length} 个人物 · 库版本 {voiceprints.revision}
+              </span>
+            )}
+          </div>
+          <p className="voiceprint-hint">
+            给说话人命名时自动抽取声纹入库，后续剧集据此自动认人/纠错（带「自动」标记，
+            手工命名永远优先）。误入库的人物可在此删除。
+          </p>
+          {voiceprintError && <p className="error-text">{voiceprintError}</p>}
+          {voiceprints && voiceprints.names.length === 0 && (
+            <p className="empty">声纹库为空。命名一个说话人后会自动存入。</p>
+          )}
+          {voiceprints?.names.map((n) => (
+            <div key={n.name} className="voiceprint-row">
+              <span className="voiceprint-name">{n.name}</span>
+              <span className="voiceprint-count">{n.vectors_count} 个声纹</span>
+              {n.source_workspace && (
+                <span className="voiceprint-source">来自 {n.source_workspace}</span>
+              )}
+              <button
+                className="delete"
+                title={`从声纹库删除「${n.name}」`}
+                onClick={() => handleDeleteVoiceprint(n.name)}
+              >
+                删除
+              </button>
+            </div>
+          ))}
+        </div>
         {workspaces && workspaces.workspaces.length === 0 && (
           <p className="empty">
             还没有工作区。任务开始运行后，中间产物会写入工作区目录，可在此手动删除释放磁盘。
@@ -673,14 +763,14 @@ export default function App() {
                   继续
                 </button>
               )}
-              {w.reusable && !hasCompletedTask && (
+              {w.openable && !hasCompletedTask && (
                 <button
                   className="resume"
                   disabled={w.busy}
                   title={
                     w.busy
                       ? "任务正在使用该工作区，稍后再进入"
-                      : "复用已完成的分析，进入擦除目标说话人选择"
+                      : "复用已完成的核心分析，进入擦除目标说话人选择（认人/转写会快速补跑）"
                   }
                   onClick={() => handleOpenWorkspace(w)}
                 >
@@ -782,7 +872,7 @@ function EraseForm({
               className="dot"
               style={{ background: speakerColor(speakers, sp.label) }}
             />
-            {names[sp.label] ?? sp.label}
+            {names[sp.label] ?? sp.name ?? sp.label}
           </label>
         ))}
       </div>
@@ -829,7 +919,7 @@ function SpeakerTimeline({
   onRename: (label: string, name: string) => Promise<string | null | undefined>;
 }) {
   const pct = (v: number) => `${((v / timeline.duration) * 100).toFixed(3)}%`;
-  const shown = (label: string) => names[label] ?? label;
+  const shown = (sp: TimelineSpeaker) => names[sp.label] ?? sp.name ?? sp.label;
   const isActive = (sp: TimelineSpeaker, seg: TimelineSegment) =>
     playing !== null &&
     playing.taskId === taskId &&
@@ -852,7 +942,8 @@ function SpeakerTimeline({
               <span className="dot" style={{ background: color }} />
               <SpeakerName
                 label={sp.label}
-                name={names[sp.label] ?? null}
+                name={names[sp.label] ?? sp.name ?? null}
+                auto={Boolean(sp.auto && !names[sp.label])}
                 onRename={onRename}
               />
               <span className="speech-time">{fmtTime(sp.speech_time)}</span>
@@ -868,8 +959,8 @@ function SpeakerTimeline({
                     width: pct(seg.end - seg.start),
                     background: color,
                   }}
-                  title={`${shown(sp.label)} · ${fmtTime(seg.start)} – ${fmtTime(seg.end)}`}
-                  aria-label={`试听 ${shown(sp.label)}，${fmtTime(seg.start)} 到 ${fmtTime(seg.end)}`}
+                  title={`${shown(sp)} · ${fmtTime(seg.start)} – ${fmtTime(seg.end)}`}
+                  aria-label={`试听 ${shown(sp)}，${fmtTime(seg.start)} 到 ${fmtTime(seg.end)}`}
                   onClick={() => onPlay(taskId, sp.label, seg)}
                 />
               ))}
@@ -883,7 +974,7 @@ function SpeakerTimeline({
                       key={i}
                       type="button"
                       className={`sample${isActive(sp, s) ? " playing" : ""}`}
-                      title={`试听 ${shown(sp.label)} 的样本 ${fmtTime(s.start)} – ${fmtTime(s.end)}`}
+                      title={`试听 ${shown(sp)} 的样本 ${fmtTime(s.start)} – ${fmtTime(s.end)}`}
                       onClick={() => onPlay(taskId, sp.label, s)}
                     >
                       <span className="sample-time">
@@ -918,10 +1009,12 @@ function SpeakerTimeline({
 function SpeakerName({
   label,
   name,
+  auto,
   onRename,
 }: {
   label: string;
   name: string | null;
+  auto?: boolean;
   onRename: (label: string, name: string) => Promise<string | null | undefined>;
 }) {
   const [editing, setEditing] = useState(false);
@@ -943,17 +1036,27 @@ function SpeakerName({
 
   if (!editing) {
     return (
-      <button
-        type="button"
-        className="speaker-name"
-        title={name ? `改名「${name}」` : `为 ${label} 命名`}
-        onClick={() => {
-          setDraft(name ?? "");
-          setEditing(true);
-        }}
-      >
-        {name ?? label}
-      </button>
+      <span className="speaker-name-wrap">
+        <button
+          type="button"
+          className="speaker-name"
+          title={name ? `改名「${name}」` : `为 ${label} 命名`}
+          onClick={() => {
+            setDraft(name ?? "");
+            setEditing(true);
+          }}
+        >
+          {name ?? label}
+        </button>
+        {auto && (
+          <span
+            className="speaker-auto"
+            title="自动认人结果，手工命名会覆盖它"
+          >
+            自动
+          </span>
+        )}
+      </span>
     );
   }
   return (

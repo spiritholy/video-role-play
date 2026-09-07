@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import math
 import os
+import threading
 from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path
@@ -100,13 +101,27 @@ class Transcriber(Protocol):
     ) -> TranscriptionResult: ...
 
 
+class VoiceprintEmbedder(Protocol):
+    name: str
+
+    def embed(
+        self,
+        wav: Path,
+        windows: Sequence[tuple[float, float]],
+        on_progress: ProgressCallback,
+    ) -> tuple[list[float], ...]:
+        """对每个时间窗口抽一个声纹向量；返回顺序与 windows 一致。"""
+        ...
+
+
 @dataclass
 class Inference:
-    """统一注入容器：Demucs / pyannote / Whisper 三个接入者挂在这里。"""
+    """统一注入容器：Demucs / pyannote / Whisper / 声纹 embedder 挂在这里。"""
 
     separator: VocalSeparator
     diarizer: SpeakerDiarizer
     transcriber: Transcriber
+    embedder: VoiceprintEmbedder
 
 
 def read_hf_token() -> str | None:
@@ -448,3 +463,100 @@ class WhisperTranscriber:
             transcripts.append(Transcription(sample=sample, text=text))
             on_progress((i + 1) / len(samples))
         return TranscriptionResult(transcripts=tuple(transcripts))
+
+
+# 声纹模型（pyannote/embedding）的 HF token / 协议失败用户指引（界面上直接展示）
+_EMBEDDER_TOKEN_MISSING_MESSAGE = (
+    "HF token 未配置：声纹模型为门控模型，需一次性配置后完全离线运行。"
+    "① 注册 huggingface.com；② 在模型页 pyannote/embedding 接受使用协议；"
+    "③ 设置环境变量 HF_TOKEN=<你的token> 后重启应用再试。"
+)
+_EMBEDDER_TOKEN_REJECTED_MESSAGE = (
+    "声纹模型下载被拒绝：HF token 无效或模型协议未接受。"
+    "请到 huggingface.com 模型页 pyannote/embedding 接受使用协议，"
+    "确认 HF_TOKEN 有效后重试。"
+)
+
+
+class PyannoteEmbedder:
+    """pyannote/embedding（CPU）说话人声纹抽取，第四个接入推理接口的模型。
+
+    门控模型：首次使用需 HF token 并在线接受协议（复用现有 token 与缓存
+    基础设施，下载后完全离线）。抽声纹一律使用 人声轨（管线传入），避开
+    背景音乐污染。load_model 加锁：认人/纠错阶段（worker 线程）与命名即
+    入库（API 线程）可能并发触碰同一实例。
+    """
+
+    name = "pyannote/embedding"
+
+    def __init__(self, model_id: str = "pyannote/embedding", inference_factory=None):
+        self._model_id = model_id
+        # inference_factory 仅用于测试注入；生产走 Model.from_pretrained + Inference
+        self._inference_factory = inference_factory
+        self._inference = None
+        self._lock = threading.Lock()
+
+    def load_model(self):
+        """懒加载并缓存 Inference；首次调用触发权重下载（需 token 与协议）。"""
+        if self._inference is not None:
+            return self._inference
+        with self._lock:
+            if self._inference is not None:
+                return self._inference
+            token = read_hf_token()
+            if token is None:
+                raise TaskError(_EMBEDDER_TOKEN_MISSING_MESSAGE)
+            factory = self._inference_factory or (
+                lambda t: self._create_inference(self._model_id, t)
+            )
+            try:
+                self._inference = factory(token)
+            except TaskError:
+                raise
+            except (GatedRepoError, RepositoryNotFoundError) as e:
+                # 403 = 协议未接受；401/404（hub 将无效 token 折叠成"仓库不存在"）
+                raise TaskError(_EMBEDDER_TOKEN_REJECTED_MESSAGE) from e
+            except Exception as e:
+                raise TaskError(
+                    f"声纹模型加载失败：{e}。首次使用需联网下载模型"
+                    "（需 HF token），请检查网络连接后重试。"
+                ) from e
+        return self._inference
+
+    def embed(
+        self,
+        wav: Path,
+        windows: Sequence[tuple[float, float]],
+        on_progress: ProgressCallback,
+    ) -> tuple[list[float], ...]:
+        inference = self.load_model()
+        vectors: list[list[float]] = []
+        total = max(1, len(windows))
+        for i, (start, end) in enumerate(windows):
+            try:
+                vec = inference.crop(str(wav), [start, end])
+            except (TaskCancelled, TaskError):
+                raise
+            except Exception as e:
+                raise TaskError(f"声纹抽取失败: {e}") from e
+            vectors.append([float(x) for x in vec])
+            on_progress((i + 1) / total)
+        return tuple(vectors)
+
+    @staticmethod
+    def _create_inference(model_id: str, token: str):
+        # 与 PyannoteDiarizer 同一缓存约定：pyannote 3.1 的默认缓存目录与
+        # huggingface_hub 不一致，必须在本方法内首次 import pyannote.audio
+        # 之前设好 PYANNOTE_CACHE，否则子模型仍会落到 torch/pyannote 缓存。
+        cache_dir = os.environ.get("PYANNOTE_CACHE") or HF_HUB_CACHE
+        os.environ["PYANNOTE_CACHE"] = cache_dir
+        try:
+            from pyannote.audio import Inference, Model
+        except ImportError as e:
+            raise TaskError(
+                "缺少依赖 pyannote.audio：请先安装 backend/requirements.txt"
+            ) from e
+        model = Model.from_pretrained(
+            model_id, use_auth_token=token, cache_dir=cache_dir
+        )
+        return Inference(model, window="whole")

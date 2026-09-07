@@ -15,8 +15,8 @@ from fastapi.responses import FileResponse, Response
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
-from . import workspace
-from .inference import Inference
+from . import voiceprints, workspace
+from .inference import Inference, SpeakerSegment
 from .manager import (
     TaskManager,
     TaskNotCancellable,
@@ -25,6 +25,8 @@ from .manager import (
 )
 from .media import TaskError, audio_tracks, ffprobe_json, run_ffmpeg_bytes
 from .models import TaskState, snapshot
+from .recognition import middle_window
+from .samples import select_samples
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_WORKSPACE_ROOT = REPO_ROOT / "workspaces"
@@ -78,6 +80,71 @@ def _load_diarization(task) -> dict:
         return json.loads(path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError):
         raise HTTPException(status_code=404, detail="说话人分离产物缺失")
+
+
+def _read_recognition(task) -> dict | None:
+    """认人/纠错产物；阶段未完成或产物缺失返回 None（回退原始结果）。"""
+    stage = _stage_of(task, "recognize")
+    artifact = stage.outputs.get("recognition") if stage else None
+    if artifact is None:
+        return None
+    path = Path(task.workspace_dir) / artifact
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+
+
+def _effective_segments(task, raw: dict) -> list[dict]:
+    """修正后时段：有认人结果用之，否则回退原始说话人分离结果。
+
+    时间轴、命名与擦除校验统一走这里，保证界面看到的人物与擦除语义一致
+    （spec #9：合并后的同一人物只显示一次，掩码按修正后时段）。
+    """
+    recognition = _read_recognition(task)
+    segments = recognition.get("segments") if recognition else None
+    if isinstance(segments, list):
+        return segments
+    return raw.get("segments", [])
+
+
+def _ingest_voiceprint(
+    root: Path, manager, task, label: str, name: str, segments: list[dict]
+) -> None:
+    """命名即入库：从该说话人的样本段（取自人声轨）抽声纹写入全局声纹库。
+
+    空名字只清手工命名、不动库；入库失败静默跳过（无缝回退：命名照常
+    生效，只是不参与跨视频认人）——手工命名永远优先于自动命名。
+    """
+    try:
+        ws = Path(task.workspace_dir)
+        manifest = workspace.read_manifest(ws) or {}
+        vocal_rel = (manifest.get("separation") or {}).get("vocal")
+        if not vocal_rel:
+            return
+        vocal_path = ws / vocal_rel
+        if not vocal_path.is_file():
+            return
+        turns = [
+            SpeakerSegment(s["speaker"], float(s["start"]), float(s["end"]))
+            for s in segments
+            if s["speaker"] == label
+        ]
+        if not turns:
+            return
+        samples = select_samples(turns, max((t.end for t in turns), default=0.0))
+        windows = [middle_window(s) for s in samples]
+        vectors = manager.inference.embedder.embed(vocal_path, windows, lambda _f: None)
+        voiceprints.add_vectors(
+            root,
+            name,
+            vectors,
+            model=manager.inference.embedder.name,
+            source_workspace=ws.name,
+        )
+    except Exception:
+        # 声纹模型不可用/抽声纹失败：不影响命名，库保持原样
+        return
 
 
 def create_app(
@@ -156,8 +223,9 @@ def create_app(
             raise HTTPException(
                 status_code=409, detail="任务正在排队或运行中，无法发起擦除"
             )
-        data = _load_diarization(task)
-        known = {s["speaker"] for s in data.get("segments", [])}
+        raw = _load_diarization(task)
+        segments = _effective_segments(task, raw)
+        known = {s["speaker"] for s in segments}
         unknown = sorted({s for s in body.speakers if s not in known})
         if unknown:
             raise HTTPException(
@@ -196,6 +264,7 @@ def create_app(
                     "size_bytes": size,
                     "size_label": workspace.format_bytes(size),
                     "reusable": workspace.analysis_reusable(ws, manifest),
+                    "openable": workspace.openable(ws, manifest),
                     "resumable": workspace.resumable(manifest),
                     "busy": manager.workspace_busy(str(ws)),
                 }
@@ -256,7 +325,7 @@ def create_app(
         manifest = workspace.read_manifest(ws)
         if manifest is None:
             raise HTTPException(status_code=404, detail="工作区没有阶段清单，无法打开")
-        if not workspace.analysis_reusable(ws, manifest):
+        if not workspace.openable(ws, manifest):
             raise HTTPException(
                 status_code=409, detail="分析产物不完整，无法进入擦除选择，请先完成分析"
             )
@@ -324,15 +393,17 @@ def create_app(
 
     @app.get("/api/tasks/{task_id}/diarization")
     def get_diarization(task_id: str):
-        """说话人时间轴数据：按说话人分组的时段（纵览全片谁在何时说话）。
+        """说话人时间轴数据：按"修正后时段"分组的说话人（认人/纠错后）。
 
-        每个说话人附带工作区元数据中的命名（未命名为 null，界面回退编号标签）。
+        合并后的同一人物只显示一次；名字 = 手工命名 ?? 自动命名 ?? null；
+        带 auto 标记（是否自动认出来的），界面据此显示「自动」徽标。
         """
         task = _require_task(manager, task_id)
-        data = _load_diarization(task)
+        raw = _load_diarization(task)
+        segments = _effective_segments(task, raw)
         turns = [
             (s["speaker"], float(s["start"]), float(s["end"]))
-            for s in data.get("segments", [])
+            for s in segments
         ]
         turns.sort(key=lambda t: t[1])
         speakers: dict[str, dict] = {}
@@ -343,21 +414,40 @@ def create_app(
             sp["speech_time"] += end - start
             sp["segments"].append({"start": start, "end": end})
         names = workspace.read_speaker_names(Path(task.workspace_dir))
+        recognition = _read_recognition(task)
+        auto_names = {
+            str(k): str(v)
+            for k, v in (recognition.get("mapping") or {}).items()
+        } if recognition else {}
+        rows = []
+        for k in sorted(speakers):
+            manual = names.get(k)
+            auto = auto_names.get(k)
+            rows.append(
+                {
+                    **speakers[k],
+                    "name": manual if manual is not None else auto,
+                    "auto": manual is None and auto is not None,
+                }
+            )
         return {
-            "model": data.get("model"),
-            "num_speakers": data.get("num_speakers", len(speakers)),
+            "model": raw.get("model"),
+            "num_speakers": len(rows),
             "duration": max((e for _, _, e in turns), default=0.0),
-            "speakers": [
-                {**speakers[k], "name": names.get(k)} for k in sorted(speakers)
-            ],
+            "speakers": rows,
         }
 
     @app.put("/api/tasks/{task_id}/speakers/{label}/name")
     def rename_speaker(task_id: str, label: str, body: SpeakerNameIn):
-        """命名/改名/清除：写入工作区元数据，随工作区存续，不强制唯一。"""
+        """命名/改名/清除：写入工作区元数据，随工作区存续，不强制唯一。
+
+        非空命名写名后同步对该名字入库（从该说话人的样本段抽声纹写入全局
+        声纹库，跨视频累积）；空名只清手工命名、不动库（spec #9）。
+        """
         task = _require_task(manager, task_id)
-        data = _load_diarization(task)
-        known = {s["speaker"] for s in data.get("segments", [])}
+        raw = _load_diarization(task)
+        segments = _effective_segments(task, raw)
+        known = {s["speaker"] for s in segments}
         if label not in known:
             raise HTTPException(status_code=404, detail="说话人不存在")
         name = body.name.strip()
@@ -368,6 +458,8 @@ def create_app(
         else:
             names.pop(label, None)  # 空白名字 = 清除命名，界面回退编号标签
         workspace.write_speaker_names(ws, names)
+        if name:
+            _ingest_voiceprint(root, manager, task, label, name, segments)
         return {"label": label, "name": name or None}
 
     @app.get("/api/tasks/{task_id}/transcripts")
@@ -445,6 +537,24 @@ def create_app(
             raise HTTPException(status_code=404, detail="产物文件缺失")
         media_type = mimetypes.guess_type(path.name)[0] or "application/octet-stream"
         return FileResponse(path, media_type=media_type)
+
+    @app.get("/api/voiceprints")
+    def get_voiceprints():
+        """声纹库列表：全局累积的人物声纹，供查看与清理误入库条目。"""
+        return {
+            "revision": voiceprints.revision(root),
+            "model": voiceprints.read_library(root).get("model"),
+            "names": voiceprints.list_names(root),
+        }
+
+    @app.delete("/api/voiceprints/{name}")
+    def delete_voiceprint(name: str):
+        """删除声纹库条目：错误命名不再污染后续剧集的认人/纠错。"""
+        if not name:
+            raise HTTPException(status_code=400, detail="名字不能为空")
+        if not voiceprints.delete_name(root, name):
+            raise HTTPException(status_code=404, detail="声纹库中没有该名字")
+        return {"deleted": name}
 
     if FRONTEND_DIST.is_dir():
         app.mount(

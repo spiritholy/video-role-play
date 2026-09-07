@@ -46,7 +46,7 @@ def test_完成后工作区存在人声轨与伴奏轨且清单更新(client, tm
     assert mean_volume(vocal) < mean_volume(accomp) - 18, "人声/伴奏应可区分"
 
     manifest = json.loads((ws / "manifest.json").read_text(encoding="utf-8"))
-    assert [s["status"] for s in manifest["stages"]] == ["done"] * 4 + ["pending"] * 2  # 分析完成；掩码合成/编码封装待擦除触发
+    assert [s["status"] for s in manifest["stages"]] == ["done"] * 5 + ["pending"] * 2  # 分析完成；掩码合成/编码封装待擦除触发
     assert manifest["separation"]["vocal"] == VOCAL
     assert manifest["separation"]["accompaniment"] == ACCOMP
     for entry in manifest["stages"]:

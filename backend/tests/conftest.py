@@ -115,15 +115,17 @@ def client(tmp_path: Path) -> TestClient:
 
 
 @contextmanager
-def make_client(tmp_path: Path, separator=None, diarizer=None, transcriber=None):
-    """按需注入自定义 separator/diarizer/transcriber（不传时用默认 canned）
-    的测试客户端工厂。"""
+def make_client(tmp_path: Path, separator=None, diarizer=None, transcriber=None,
+                embedder=None):
+    """按需注入自定义 separator/diarizer/transcriber/embedder（不传时用默认
+    canned）的测试客户端工厂。"""
     app = create_app(
         workspace_root=tmp_path / "workspaces",
         inference=Inference(
             separator=separator or CannedSeparator(),
             diarizer=diarizer or CannedDiarizer(),
             transcriber=transcriber or CannedTranscriber(),
+            embedder=embedder or CannedEmbedder(),
         ),
     )
     with TestClient(app) as c:
@@ -225,6 +227,37 @@ class CannedSeparator:
             self.gate.wait(timeout=60)
         on_progress(1.0)
         return SeparationStems(vocal=vocal, accompaniment=accomp)
+
+
+class CannedEmbedder:
+    """声纹抽取替身：按窗口中心命中已登记的时间区间返回对应向量。
+
+    regions: [(start, end, vector)] —— 落入该区间的窗口返回对应向量，
+    模拟"该音频区段是某说话人"；未命中回退 default（与库中任何人都不
+    相似）。记录收到的窗口供"抽声纹范围/复用产物零调用"断言。
+    """
+
+    name = "canned-embedder"
+
+    def __init__(self, regions=(), default: list[float] | None = None):
+        self.regions = [(float(a), float(b), list(v)) for a, b, v in regions]
+        self.default = default or [0.0, 0.0, 0.0, 0.0]
+        self.calls: list[tuple[Path, tuple[tuple[float, float], ...]]] = []
+
+    def embed(self, wav: Path, windows, on_progress):
+        self.calls.append((Path(wav), tuple(windows)))
+        out = []
+        for start, end in windows:
+            center = (start + end) / 2
+            vec = self.default
+            for a, b, v in self.regions:
+                if a <= center <= b:
+                    vec = v
+                    break
+            out.append(list(vec))
+            on_progress(0.5)
+        on_progress(1.0)
+        return tuple(out)
 
 
 class FailOnceSeparator(CannedSeparator):

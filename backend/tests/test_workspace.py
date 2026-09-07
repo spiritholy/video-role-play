@@ -29,7 +29,7 @@ def test_完成任务的阶段产物与清单落盘(client, tmp_path):
     assert manifest["output"] is None, "分析完成不产成品"
     assert manifest["audio_track"]["index"] == 0
     assert [s["status"] for s in manifest["stages"]] == (
-        ["done"] * 4 + ["pending"] * 2  # 分析完成；掩码合成/编码封装待擦除触发
+        ["done"] * 5 + ["pending"] * 2  # 分析完成；掩码合成/编码封装待擦除触发
     )
 
     stage_dirs = [p.name for p in ws.iterdir() if p.is_dir()]
@@ -53,7 +53,7 @@ def test_擦除后清单记录成品路径且与任务一致(client, tmp_path):
     assert manifest["state"] == "completed"
     assert manifest["output"]["path"] == done["output_path"]
     assert manifest["erase"]["speakers"] == ["SPEAKER_00"]
-    assert [s["status"] for s in manifest["stages"]] == ["done"] * 6
+    assert [s["status"] for s in manifest["stages"]] == ["done"] * 7
     mix = list((ws / "05-mask-erase").glob("*.wav"))
     assert len(mix) == 1, "掩码合成阶段应产出擦除后的混音 wav"
 

@@ -19,8 +19,10 @@ _UNSAFE = re.compile(r"[^\w.\-]", re.UNICODE)
 
 MANIFEST_VERSION = 1
 
-# 分析阶段（①–④）：产物昂贵且与目标说话人无关，可跨任务复用
-ANALYSIS_STAGES = ("audio_extract", "separate", "diarize", "transcribe")
+# 分析阶段（①–④ + 认人/纠错）：产物昂贵且与目标说话人无关，可跨任务
+# 复用。认人/纠错是 spec #9 新增的分析阶段，其产物随声纹库 revision 失效，
+# 只重跑它自己与样本转写（不重跑说话人分离与音源分离）。
+ANALYSIS_STAGES = ("audio_extract", "separate", "diarize", "recognize", "transcribe")
 
 
 class WorkspaceNotFound(Exception):
@@ -54,6 +56,34 @@ def read_manifest(ws: Path) -> dict | None:
         return json.loads(path.read_text(encoding="utf-8"))
     except (json.JSONDecodeError, OSError):
         return None
+
+
+def ensure_stage_entries(manifest: dict | None, stage_defs) -> None:
+    """确保清单包含全部阶段条目；旧清单缺失的按待运行物化。
+
+    认人/纠错阶段是升级后新增的：升级前的工作区清单里没有它的条目，直接
+    按待运行物化，保证重开不崩（阶段列表统一由任务重建，物化只补条目不
+    写盘，待任务运行时随清单落盘）。
+    """
+    if not isinstance(manifest, dict):
+        return
+    present = {
+        e.get("id")
+        for e in manifest.get("stages") or []
+        if isinstance(e, dict) and isinstance(e.get("id"), str)
+    }
+    for stage_id, name in stage_defs:
+        if stage_id in present:
+            continue
+        manifest.setdefault("stages", []).append(
+            {
+                "id": stage_id,
+                "name": name,
+                "status": "pending",
+                "artifacts": [],
+                "outputs": {},
+            }
+        )
 
 
 def write_manifest(ws: Path, manifest: dict) -> None:
@@ -119,8 +149,23 @@ def done_stages(ws: Path, manifest: dict | None) -> set[str]:
 
 
 def analysis_reusable(ws: Path, manifest: dict | None) -> bool:
-    """四个分析阶段是否齐全（同源新任务可直接复用，几分钟出新成品）。"""
+    """全部分析阶段是否齐全（同源新任务可直接复用，几分钟出新成品）。
+
+    含认人/纠错：升级前的工作区缺该阶段条目，须先跑一轮认人/纠错与样本
+    转写才可复用（昂贵的说话人分离与音源分离不重算）。
+    """
     return set(ANALYSIS_STAGES) <= done_stages(ws, manifest)
+
+
+# 打开擦除选择所需的"核心分析"：昂贵阶段齐全即可。认人/纠错与样本转写
+# 会在打开任务里快速补跑（无声纹库时认人是恒等），不阻塞老工作区进入
+# 擦除选择（spec #9：升级前工作区重开不崩）。
+CORE_STAGES = ("audio_extract", "separate", "diarize")
+
+
+def openable(ws: Path, manifest: dict | None) -> bool:
+    """核心分析是否齐全：可打开进入擦除选择（认人/转写由任务补跑）。"""
+    return set(CORE_STAGES) <= done_stages(ws, manifest)
 
 
 def read_speaker_names(ws: Path) -> dict[str, str]:
