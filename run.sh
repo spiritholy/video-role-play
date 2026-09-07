@@ -35,7 +35,8 @@ has_file_token() {
 if ! has_env_token && ! has_file_token; then
   echo "[warn] 未找到 HF token（进程环境与环境变量文件都没有）"
   echo "[warn] 建议：cp .env.example .env && chmod 600 .env，再把 token 填进 .env"
-  echo "[warn] 现在仍能启动并使用到「人声/伴奏分离」，之后会在「说话人分离」失败。"
+  echo "[warn] 现在仍能启动并使用到「人声/伴奏分离」，之后会在「说话人分离」失败；"
+  echo "[warn] 认人/纠错与命名入库会静默跳过（命名照常生效，只是不参与跨视频自动认人）。"
 fi
 
 exec "$VENV_PY" run.py "$@"

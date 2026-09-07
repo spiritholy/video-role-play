@@ -69,7 +69,8 @@ def main() -> None:
         print(f"[env] 已从 {args.env_file} 注入：{', '.join(loaded)}")
     if not any(os.environ.get(var) for var in HF_TOKEN_VARS):
         print(
-            "[warn] 未配置 HF token：任务会在「说话人分离」阶段失败。"
+            "[warn] 未配置 HF token：任务会在「说话人分离」阶段失败；"
+            "认人/纠错与命名入库静默跳过（命名照常生效）。"
             "cp .env.example .env 并填入 token（详见 .env.example 注释）"
         )
 
