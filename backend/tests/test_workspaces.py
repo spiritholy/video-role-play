@@ -4,13 +4,19 @@
 排队/运行中任务使用的工作区不可删（删了会把跑到一半的任务掏空）。
 """
 
+import json
 import threading
 from pathlib import Path
+
+from app.media import TaskError
 
 from conftest import (
     CannedDiarizer,
     CannedSeparator,
+    FailOnceSeparator,
+    erase,
     get_task,
+    run_ffmpeg,
     make_client,
     make_video,
     run_to_analysis,
@@ -126,3 +132,166 @@ def test_删除不接受越出工作区根目录的名字(client, tmp_path):
     assert outside.is_dir()
     assert tmp_path.is_dir()
     assert (tmp_path / "workspaces" / "甲").is_dir()
+
+def test_重启后从工作区继续_已完成阶段不重算且保留人数(tmp_path):
+    separator = FailOnceSeparator(TaskError("分离失败（模拟）"))
+    diarizer = CannedDiarizer()
+    video = make_video(tmp_path, "重启.mp4")
+
+    with make_client(tmp_path, separator=separator) as client:
+        task = submit_task(client, video, num_speakers=4)
+        wait_for(lambda: get_task(client, task["id"])["state"] == "failed")
+
+    with make_client(tmp_path, separator=separator, diarizer=diarizer) as client:
+        w = workspace_items(client)["重启"]
+        assert w["resumable"] is True, "未完成的工作区应可继续"
+
+        resp = client.post("/api/workspaces/重启/resume")
+        assert resp.status_code == 200, resp.text
+        new_task = resp.json()
+        assert new_task["num_speakers"] == 4, "清单应保留用户指定的说话人人数"
+        assert new_task["state"] in ("queued", "running")
+
+        wait_for(lambda: get_task(client, new_task["id"])["state"] == "completed")
+        assert len(separator.calls) == 2, "续跑只重跑断点阶段，不重算已完成阶段"
+        assert diarizer.num_speakers == [4], "续跑应继续沿用指定人数"
+
+
+def test_分析已完成的工作区不可继续(client, tmp_path):
+    run_to_analysis(client, make_video(tmp_path, "已完成.mp4"))
+
+    w = workspace_items(client)["已完成"]
+    assert w["resumable"] is False, "分析已完成没有断点可继续"
+    resp = client.post("/api/workspaces/已完成/resume")
+    assert resp.status_code == 409, resp.text
+
+
+def test_无清单工作区不可继续(client, tmp_path):
+    (tmp_path / "workspaces" / "空").mkdir(parents=True)
+
+    w = workspace_items(client)["空"]
+    assert w["resumable"] is False
+    resp = client.post("/api/workspaces/空/resume")
+    assert resp.status_code == 404, resp.text
+
+
+def test_源视频缺失时继续被拒绝且不创建任务(tmp_path):
+    separator = FailOnceSeparator(TaskError("分离失败（模拟）"))
+    video = make_video(tmp_path, "消失.mp4")
+
+    with make_client(tmp_path, separator=separator) as client:
+        task = submit_task(client, video)
+        wait_for(lambda: get_task(client, task["id"])["state"] == "failed")
+    video.unlink()
+
+    with make_client(tmp_path) as client:
+        resp = client.post("/api/workspaces/消失/resume")
+        assert resp.status_code == 400, resp.text
+        assert "源视频不存在" in resp.json()["detail"]
+        assert client.get("/api/tasks").json()["tasks"] == [], (
+            "源视频缺失不应创建排队任务"
+        )
+
+
+def test_任务使用中的工作区不可继续(tmp_path):
+    gate = threading.Event()
+    video = make_video(tmp_path, "占用中.mp4")
+    with make_client(tmp_path, diarizer=CannedDiarizer(gate=gate)) as client:
+        task = submit_task(client, video)
+        wait_for(lambda: get_task(client, task["id"])["state"] == "running")
+
+        w = workspace_items(client)["占用中"]
+        assert w["busy"] is True
+        resp = client.post("/api/workspaces/占用中/resume")
+        assert resp.status_code == 409, resp.text
+
+        gate.set()
+        wait_for(lambda: get_task(client, task["id"])["state"] == "completed")
+
+
+def test_擦除请求提前落盘且可从工作区续跑擦除(tmp_path):
+    video = make_video(tmp_path, "擦除失败.mp4")
+    with make_client(tmp_path) as client:
+        task = run_to_analysis(client, video)
+        ws = tmp_path / "workspaces" / "擦除失败"
+        manifest = json.loads((ws / "manifest.json").read_text(encoding="utf-8"))
+        (ws / manifest["separation"]["vocal"]).unlink()  # 逼掩码合成失败
+
+        resp = erase(client, task["id"], ["SPEAKER_00"])
+        assert resp.status_code == 200, resp.text
+        wait_for(lambda: get_task(client, task["id"])["state"] == "failed")
+
+        manifest = json.loads((ws / "manifest.json").read_text(encoding="utf-8"))
+        assert manifest["erase"] == {
+            "speakers": ["SPEAKER_00"],
+            "output_dir": None,
+        }, "擦除请求应在阶段运行前就落盘，失败后仍可恢复"
+
+        assert workspace_items(client)["擦除失败"]["resumable"] is True
+        r = client.post("/api/workspaces/擦除失败/resume")
+        assert r.status_code == 200, r.text
+        new_task = r.json()
+        assert new_task["erase"]["speakers"] == ["SPEAKER_00"], (
+            "工作区续跑应重建擦除任务而非退回分析"
+        )
+
+
+def test_中断擦除可从工作区续跑且不重算掩码(tmp_path):
+    video = make_video(tmp_path, "中断擦除.mp4")
+    ws = tmp_path / "workspaces" / "中断擦除"
+    mix_dir = ws / "05-mask-erase"
+    mix_dir.mkdir(parents=True)
+    mix = mix_dir / "mix.wav"
+    run_ffmpeg(["-f", "lavfi", "-i", "sine=frequency=440:duration=2", str(mix)])
+
+    manifest = {
+        "version": 1,
+        "source": {
+            "path": str(video),
+            "container": ".mp4",
+            "size_bytes": video.stat().st_size,
+        },
+        "requested_audio_track": None,
+        "requested_num_speakers": None,
+        "audio_track": None,
+        "separation": None,
+        "diarization": {"segments": []},
+        "transcription": None,
+        "mask_erase": {"targets": ["SPEAKER_00"], "intervals": []},
+        "erase": {"speakers": ["SPEAKER_00"], "output_dir": None},
+        "output": None,
+        "state": "running",
+        "error": None,
+        "stages": [
+            {"id": sid, "status": "done", "artifacts": [], "outputs": {}}
+            for sid in ("audio_extract", "separate", "diarize", "transcribe")
+        ]
+        + [
+            {
+                "id": "mask_erase",
+                "status": "done",
+                "artifacts": ["05-mask-erase/mix.wav"],
+                "outputs": {"erased_mix": "05-mask-erase/mix.wav"},
+            },
+            {"id": "encode_mux", "status": "pending", "artifacts": [], "outputs": {}},
+        ],
+    }
+    (ws / "manifest.json").write_text(
+        json.dumps(manifest, ensure_ascii=False), encoding="utf-8"
+    )
+
+    with make_client(tmp_path) as client:
+        w = workspace_items(client)["中断擦除"]
+        assert w["resumable"] is True
+        before = mix.stat().st_mtime_ns
+
+        r = client.post("/api/workspaces/中断擦除/resume")
+        assert r.status_code == 200, r.text
+        new_task = r.json()
+        assert new_task["erase"]["speakers"] == ["SPEAKER_00"], (
+            "中断擦除续跑应重建擦除任务而非退回分析"
+        )
+        wait_for(lambda: get_task(client, new_task["id"])["state"] == "completed")
+
+        assert mix.stat().st_mtime_ns == before, "掩码合成产物应复用，不重算"
+        assert list(video.parent.glob("中断擦除__*")), "成品视频应生成"

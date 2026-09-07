@@ -104,6 +104,7 @@ interface WorkspaceItem {
   size_bytes: number;
   size_label: string;
   reusable: boolean;
+  resumable: boolean;
   busy: boolean;
 }
 
@@ -380,6 +381,25 @@ export default function App() {
     refresh();
   }
 
+  async function handleResumeWorkspace(w: WorkspaceItem) {
+    setWorkspaceError(null);
+    try {
+      const resp = await fetch(
+        `/api/workspaces/${encodeURIComponent(w.name)}/resume`,
+        { method: "POST" },
+      );
+      if (!resp.ok) {
+        const data = await resp.json().catch(() => null);
+        setWorkspaceError(data?.detail ?? "续跑失败");
+        return;
+      }
+    } catch {
+      setWorkspaceError("无法连接后端服务");
+      return;
+    }
+    refresh();
+  }
+
   async function handleDeleteWorkspace(w: WorkspaceItem) {
     const confirmed = window.confirm(
       `删除工作区「${w.name}」？\n\n释放 ${w.size_label}，` +
@@ -604,6 +624,20 @@ export default function App() {
                 {w.reusable ? "分析可复用" : "分析未完成"}
               </span>
               {w.busy && <span className="workspace-tag tag-busy">任务使用中</span>}
+              {w.resumable && (
+                <button
+                  className="resume"
+                  disabled={w.busy}
+                  title={
+                    w.busy
+                      ? "任务正在使用该工作区，取消任务后再继续"
+                      : "从断点继续处理该源视频，不重算已完成阶段"
+                  }
+                  onClick={() => handleResumeWorkspace(w)}
+                >
+                  继续
+                </button>
+              )}
               <button
                 className="delete"
                 disabled={w.busy}

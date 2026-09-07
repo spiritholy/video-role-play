@@ -18,6 +18,7 @@ from conftest import (
     CannedDiarizer,
     CannedSeparator,
     CannedTranscriber,
+    FailOnceSeparator,
     call_counts,
     erase,
     get_task,
@@ -35,18 +36,6 @@ ERASED_MIX = Path("05-mask-erase") / "erased_mix.wav"
 
 def resume(client, task_id: str):
     return client.post(f"/api/tasks/{task_id}/resume")
-
-
-class FailOnceSeparator(CannedSeparator):
-    """首次调用失败、之后正常：模拟可重试的人声/伴奏分离失败。"""
-
-    def __init__(self, error: Exception):
-        super().__init__()
-        self._error = error
-
-    def separate(self, wav: Path, out_dir: Path, on_progress):
-        self.fail = None if self.calls else self._error
-        return super().separate(wav, out_dir, on_progress)
 
 
 class FailOnceTranscriber(CannedTranscriber):

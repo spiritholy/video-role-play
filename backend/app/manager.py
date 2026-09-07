@@ -7,7 +7,7 @@ import uuid
 from collections import deque
 from pathlib import Path
 
-from . import pipeline
+from . import pipeline, workspace
 from .inference import (
     DemucsSeparator,
     Inference,
@@ -132,6 +132,32 @@ class TaskManager:
             if task.state not in (TaskState.FAILED, TaskState.CANCELLED):
                 raise TaskNotResumable(task.state.value)
             self._requeue(task)
+        self._wake.set()
+        return task
+
+    def resume_workspace(self, ws: Path, manifest: dict) -> Task:
+        """按工作区清单重建断点任务并入队（重启后从工作区一键续跑）。
+
+        重启会清空任务内存，清单才是断点依据：恢复源视频、音轨、说话人
+        人数与擦除请求，管线按清单跳过已完成阶段直接续跑。入队前就登记
+        工作区占用，避免同一工作区被重复排队。
+        """
+        source = workspace.source_path(manifest)
+        if not source:
+            raise TaskNotResumable("工作区清单缺少源视频路径")
+        task = Task(
+            id=uuid.uuid4().hex[:12],
+            video_path=source,
+            audio_track=workspace.requested_audio_track(manifest),
+            num_speakers=workspace.requested_num_speakers(manifest),
+        )
+        task.workspace_dir = str(ws)
+        task.erase = workspace.erase_request(manifest)
+        with self._lock:
+            if self.workspace_busy(str(ws)):
+                raise TaskNotResumable("工作区正在被任务使用")
+            self._tasks[task.id] = task
+            self._queue.append(task.id)
         self._wake.set()
         return task
 

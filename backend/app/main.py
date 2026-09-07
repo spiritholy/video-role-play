@@ -85,9 +85,9 @@ def create_app(
     on_start: Callable[[], None] | None = None,
     inference: Inference | None = None,
 ) -> FastAPI:
-    root = workspace_root or Path(
-        os.environ.get("VRP_WORKSPACE_ROOT", DEFAULT_WORKSPACE_ROOT)
-    )
+    root = Path(
+        workspace_root or os.environ.get("VRP_WORKSPACE_ROOT", DEFAULT_WORKSPACE_ROOT)
+    ).resolve()
     manager = TaskManager(root, inference=inference)
 
     @asynccontextmanager
@@ -196,6 +196,7 @@ def create_app(
                     "size_bytes": size,
                     "size_label": workspace.format_bytes(size),
                     "reusable": workspace.analysis_reusable(ws, manifest),
+                    "resumable": workspace.resumable(manifest),
                     "busy": manager.workspace_busy(str(ws)),
                 }
             )
@@ -205,6 +206,38 @@ def create_app(
             "total_bytes": total,
             "total_label": workspace.format_bytes(total),
         }
+
+    @app.post("/api/workspaces/{name}/resume")
+    def resume_workspace(name: str):
+        """重启后从工作区一键续跑：按清单重建任务并入队。
+
+        重启会清空任务内存，工作区清单才是断点依据。源视频缺失时不建任务
+        直接报错，避免排队半天才发现白跑；工作区被占用时拒绝（重复点击、
+        正在运行的旧任务都算占用）。
+        """
+        try:
+            ws = workspace.resolve(root, name)
+        except workspace.WorkspaceNotFound:
+            raise HTTPException(status_code=404, detail="工作区不存在")
+        manifest = workspace.read_manifest(ws)
+        if manifest is None:
+            raise HTTPException(status_code=404, detail="工作区没有阶段清单，无法继续")
+        if not workspace.resumable(manifest):
+            raise HTTPException(
+                status_code=409, detail="当前工作区没有可继续的断点"
+            )
+        source = workspace.source_path(manifest)
+        if not source or not Path(source).is_file():
+            raise HTTPException(status_code=400, detail=f"源视频不存在: {source}")
+        if manager.workspace_busy(str(ws)):
+            raise HTTPException(status_code=409, detail="工作区正在被任务使用，无法继续")
+        try:
+            task = manager.resume_workspace(ws, manifest)
+        except TaskNotResumable:
+            raise HTTPException(
+                status_code=409, detail="工作区正在被任务使用，无法继续"
+            )
+        return snapshot(task)
 
     @app.delete("/api/workspaces/{name}")
     def delete_workspace(name: str):

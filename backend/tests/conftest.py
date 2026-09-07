@@ -227,6 +227,18 @@ class CannedSeparator:
         return SeparationStems(vocal=vocal, accompaniment=accomp)
 
 
+class FailOnceSeparator(CannedSeparator):
+    """首次调用失败、之后正常：模拟可重试的人声/伴奏分离失败。"""
+
+    def __init__(self, error):
+        super().__init__()
+        self._error = error
+
+    def separate(self, wav, out_dir, on_progress):
+        self.fail = None if self.calls else self._error
+        return super().separate(wav, out_dir, on_progress)
+
+
 class NoiseStemsSeparator:
     """粉噪声 stems 替身：人声/伴奏各一路独立粉噪声。
 

@@ -191,3 +191,50 @@ def format_bytes(n: float) -> str:
         if n >= scale:
             return f"{n / scale:.1f} {unit}"
     return f"{n:.0f} B"
+
+
+def resumable(manifest: dict | None) -> bool:
+    """清单是否代表一轮未结束的任务（重启后可从工作区一键继续）。"""
+    return isinstance(manifest, dict) and manifest.get("state") in (
+        "running", "failed", "cancelled",
+    )
+
+
+def requested_audio_track(manifest: dict | None) -> int | None:
+    """清单记录的音轨选择（None=默认第一条）。"""
+    if not isinstance(manifest, dict):
+        return None
+    value = manifest.get("requested_audio_track")
+    return value if isinstance(value, int) else None
+
+
+def requested_num_speakers(manifest: dict | None) -> int | None:
+    """从清单恢复用户指定的说话人人数；旧清单回退到说话人分离产物。
+
+    None 表示让模型自动估计。新清单在创建时就把请求人数写在顶层，
+    说话人分离还没跑到也能在重启后原样续跑。
+    """
+    if not isinstance(manifest, dict):
+        return None
+    value = manifest.get("requested_num_speakers")
+    if isinstance(value, int):
+        return value
+    diarization = manifest.get("diarization")
+    if isinstance(diarization, dict):
+        value = diarization.get("requested_num_speakers")
+        if isinstance(value, int):
+            return value
+    return None
+
+
+def erase_request(manifest: dict | None) -> dict | None:
+    """清单记录的最近一次擦除请求；没有则返回 None（续跑回到分析断点）。"""
+    if not isinstance(manifest, dict):
+        return None
+    erase = manifest.get("erase")
+    if not isinstance(erase, dict) or not isinstance(erase.get("speakers"), list):
+        return None
+    return {
+        "speakers": sorted({str(s) for s in erase["speakers"]}),
+        "output_dir": erase.get("output_dir"),
+    }

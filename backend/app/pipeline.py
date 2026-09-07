@@ -114,6 +114,12 @@ def run_erase(task, ctx: RunContext) -> None:
     erase_req = task.erase or {}
     targets = [str(s) for s in erase_req.get("speakers", [])]
     _prepare_erase_stages(task, ws, manifest, targets)
+    # 擦除请求在阶段运行前就落盘：中途失败/取消/进程重启后，
+    # 工作区续跑能按这份请求重建擦除任务（而不是退回分析）。
+    manifest["erase"] = {
+        "speakers": targets,
+        "output_dir": erase_req.get("output_dir"),
+    }
     manifest["state"] = "running"
     manifest["error"] = None
     _check_cancelled(ctx.cancel_event)
@@ -121,10 +127,6 @@ def run_erase(task, ctx: RunContext) -> None:
     def stages():
         mix = _stage_mask_erase(task, ctx, ws, manifest, targets)
         _stage_encode_mux(task, ctx, ws, manifest, src, mix, targets)
-        manifest["erase"] = {
-            "speakers": targets,
-            "output_dir": erase_req.get("output_dir"),
-        }
 
     _run_stages(task, manifest, stages)
 
@@ -161,6 +163,7 @@ def _new_manifest(task, src: Path) -> dict:
             "size_bytes": src.stat().st_size,
         },
         "requested_audio_track": task.audio_track,
+        "requested_num_speakers": task.num_speakers,
         "audio_track": None,
         "separation": None,
         "diarization": None,
