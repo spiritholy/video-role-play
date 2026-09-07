@@ -15,6 +15,7 @@ from conftest import (
     CannedSeparator,
     FailOnceSeparator,
     erase,
+    erase_to_completion,
     get_task,
     run_ffmpeg,
     make_client,
@@ -295,3 +296,112 @@ def test_中断擦除可从工作区续跑且不重算掩码(tmp_path):
 
         assert mix.stat().st_mtime_ns == before, "掩码合成产物应复用，不重算"
         assert list(video.parent.glob("中断擦除__*")), "成品视频应生成"
+
+
+def test_从可复用工作区打开进入擦除选择_不重算分析且不带历史擦除(tmp_path):
+    separator = CannedSeparator()
+    video = make_video(tmp_path, "可复用.mp4")
+    with make_client(tmp_path, separator=separator) as client:
+        run_to_analysis(client, video)
+        assert len(separator.calls) == 1
+
+        w = workspace_items(client)["可复用"]
+        assert w["reusable"] is True
+        resp = client.post("/api/workspaces/可复用/open")
+        assert resp.status_code == 200, resp.text
+        task = resp.json()
+        assert task["erase"] is None, "打开擦除选择不应携带历史擦除请求"
+
+        wait_for(lambda: get_task(client, task["id"])["state"] == "completed")
+        assert len(separator.calls) == 1, "分析产物应整体复用，不重算分离"
+        assert get_task(client, task["id"])["output_path"] is None
+        assert client.get(f"/api/tasks/{task['id']}/diarization").status_code == 200, (
+            "打开后应能读取说话人时间轴，供擦除表单渲染"
+        )
+
+
+def test_打开已完成擦除的工作区不携带旧擦除请求(tmp_path):
+    video = make_video(tmp_path, "已擦除.mp4")
+    with make_client(tmp_path) as client:
+        task = run_to_analysis(client, video)
+        erase_to_completion(client, task["id"], ["SPEAKER_00"])
+
+        w = workspace_items(client)["已擦除"]
+        assert w["reusable"] is True
+        resp = client.post("/api/workspaces/已擦除/open")
+        assert resp.status_code == 200, resp.text
+        new_task = resp.json()
+        assert new_task["erase"] is None, "打开擦除选择不应继承上次擦除目标"
+
+        wait_for(lambda: get_task(client, new_task["id"])["state"] == "completed")
+        done = get_task(client, new_task["id"])
+        assert done["output_path"] is None, "打开擦除选择只物化分析，不重复封装成品"
+        assert client.get(f"/api/tasks/{new_task['id']}/diarization").status_code == 200
+
+
+def test_分析未完成或无清单的工作区不可打开(tmp_path):
+    separator = FailOnceSeparator(TaskError("分离失败（模拟）"))
+    video = make_video(tmp_path, "分析失败.mp4")
+    with make_client(tmp_path, separator=separator) as client:
+        task = submit_task(client, video)
+        wait_for(lambda: get_task(client, task["id"])["state"] == "failed")
+
+        w = workspace_items(client)["分析失败"]
+        assert w["reusable"] is False
+        resp = client.post("/api/workspaces/分析失败/open")
+        assert resp.status_code == 409, resp.text
+        assert "分析产物不完整" in resp.json()["detail"]
+        tasks = client.get("/api/tasks").json()["tasks"]
+        assert [t["id"] for t in tasks] == [task["id"]], (
+            "拒绝打开不应额外创建任务"
+        )
+
+    (tmp_path / "workspaces" / "空").mkdir(parents=True)
+    with make_client(tmp_path) as client:
+        assert client.post("/api/workspaces/空/open").status_code == 404
+        assert client.post("/api/workspaces/不存在/open").status_code == 404
+
+
+def test_源视频缺失或变化时打开被拒绝且不创建任务(tmp_path):
+    video = make_video(tmp_path, "消失.mp4")
+    with make_client(tmp_path) as client:
+        run_to_analysis(client, video)
+    video.unlink()
+
+    with make_client(tmp_path) as client:
+        resp = client.post("/api/workspaces/消失/open")
+        assert resp.status_code == 400, resp.text
+        assert "源视频不存在" in resp.json()["detail"]
+        assert client.get("/api/tasks").json()["tasks"] == [], (
+            "源视频缺失不应创建排队任务"
+        )
+
+    # 同路径换成另一个文件（体积不同）：复用依据失效，拒绝而非静默从头重算
+    make_video(tmp_path, "消失.mp4", duration=3)
+    with make_client(tmp_path) as client:
+        resp = client.post("/api/workspaces/消失/open")
+        assert resp.status_code == 400, resp.text
+        assert "源视频已变化" in resp.json()["detail"]
+        assert client.get("/api/tasks").json()["tasks"] == [], (
+            "源视频变化不应创建排队任务"
+        )
+
+
+def test_运行中的工作区不可打开(tmp_path):
+    gate = threading.Event()
+    video = make_video(tmp_path, "占用中.mp4")
+    with make_client(tmp_path, diarizer=CannedDiarizer(gate=gate)) as client:
+        task = submit_task(client, video)
+        wait_for(lambda: get_task(client, task["id"])["state"] == "running")
+
+        w = workspace_items(client)["占用中"]
+        assert w["busy"] is True
+        resp = client.post("/api/workspaces/占用中/open")
+        assert resp.status_code == 409, resp.text
+        tasks = client.get("/api/tasks").json()["tasks"]
+        assert [t["id"] for t in tasks] == [task["id"]], (
+            "占用中的工作区不应额外创建任务"
+        )
+
+        gate.set()
+        wait_for(lambda: get_task(client, task["id"])["state"] == "completed")

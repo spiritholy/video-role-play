@@ -142,6 +142,25 @@ class TaskManager:
         人数与擦除请求，管线按清单跳过已完成阶段直接续跑。入队前就登记
         工作区占用，避免同一工作区被重复排队。
         """
+        return self._workspace_task(ws, manifest, workspace.erase_request(manifest))
+
+    def open_workspace(self, ws: Path, manifest: dict) -> Task:
+        """把分析产物齐全的工作区物化为可操作任务并入队（进入擦除选择）。
+
+        与续跑的区别：不带历史擦除请求——这是新的擦除目标选择，不是继续
+        上一次擦除；分析阶段按清单全部跳过、任务几乎瞬间完成，卡片上就是
+        说话人时间轴与擦除目标多选表单。入队前同样登记工作区占用。
+        """
+        return self._workspace_task(ws, manifest, None)
+
+    def _workspace_task(self, ws: Path, manifest: dict, erase: dict | None) -> Task:
+        """按工作区清单重建任务并入队（调用方不持锁）。
+
+        重启会清空任务内存，清单才是断点依据：恢复源视频、音轨与说话人
+        人数，管线按清单跳过已完成阶段直接续跑。入队前就登记工作区占用，
+        避免同一工作区被重复排队。erase 由调用方决定：续跑带历史擦除请求，
+        打开擦除选择不带。
+        """
         source = workspace.source_path(manifest)
         if not source:
             raise TaskNotResumable("工作区清单缺少源视频路径")
@@ -152,7 +171,7 @@ class TaskManager:
             num_speakers=workspace.requested_num_speakers(manifest),
         )
         task.workspace_dir = str(ws)
-        task.erase = workspace.erase_request(manifest)
+        task.erase = erase
         with self._lock:
             if self.workspace_busy(str(ws)):
                 raise TaskNotResumable("工作区正在被任务使用")

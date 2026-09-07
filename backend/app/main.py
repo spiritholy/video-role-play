@@ -239,6 +239,46 @@ def create_app(
             )
         return snapshot(task)
 
+    @app.post("/api/workspaces/{name}/open")
+    def open_workspace(name: str):
+        """打开「分析可复用」的工作区进入擦除选择：物化复用分析产物的任务。
+
+        已完成的任务没有断点，下一步是发起擦除而非续跑（CONTEXT.md）：该
+        接口为分析产物齐全的工作区重建一张任务卡片，分析阶段按清单全部跳过、
+        秒级完成，卡片上就是说话人时间轴与「擦除目标说话人」选择表单。不带
+        历史擦除请求——这是新的擦除目标选择。源视频缺失或已变化时不建任务
+        直接报错，避免复用产物与当前文件对不上。
+        """
+        try:
+            ws = workspace.resolve(root, name)
+        except workspace.WorkspaceNotFound:
+            raise HTTPException(status_code=404, detail="工作区不存在")
+        manifest = workspace.read_manifest(ws)
+        if manifest is None:
+            raise HTTPException(status_code=404, detail="工作区没有阶段清单，无法打开")
+        if not workspace.analysis_reusable(ws, manifest):
+            raise HTTPException(
+                status_code=409, detail="分析产物不完整，无法进入擦除选择，请先完成分析"
+            )
+        source = workspace.source_path(manifest)
+        if not source or not Path(source).is_file():
+            raise HTTPException(status_code=400, detail=f"源视频不存在: {source}")
+        track = workspace.requested_audio_track(manifest)
+        if not workspace.is_for_source(manifest, source, track):
+            raise HTTPException(
+                status_code=400,
+                detail="源视频已变化，工作区分析产物不再对应，请重新提交处理任务",
+            )
+        if manager.workspace_busy(str(ws)):
+            raise HTTPException(status_code=409, detail="工作区正在被任务使用，无法打开")
+        try:
+            task = manager.open_workspace(ws, manifest)
+        except TaskNotResumable:
+            raise HTTPException(
+                status_code=409, detail="工作区正在被任务使用，无法打开"
+            )
+        return snapshot(task)
+
     @app.delete("/api/workspaces/{name}")
     def delete_workspace(name: str):
         """手动删除工作区释放磁盘；只影响该源视频的工作区。"""

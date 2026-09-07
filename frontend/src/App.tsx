@@ -400,6 +400,25 @@ export default function App() {
     refresh();
   }
 
+  async function handleOpenWorkspace(w: WorkspaceItem) {
+    setWorkspaceError(null);
+    try {
+      const resp = await fetch(
+        `/api/workspaces/${encodeURIComponent(w.name)}/open`,
+        { method: "POST" },
+      );
+      if (!resp.ok) {
+        const data = await resp.json().catch(() => null);
+        setWorkspaceError(data?.detail ?? "打开擦除界面失败");
+        return;
+      }
+    } catch {
+      setWorkspaceError("无法连接后端服务");
+      return;
+    }
+    refresh();
+  }
+
   async function handleDeleteWorkspace(w: WorkspaceItem) {
     const confirmed = window.confirm(
       `删除工作区「${w.name}」？\n\n释放 ${w.size_label}，` +
@@ -615,7 +634,11 @@ export default function App() {
             还没有工作区。任务开始运行后，中间产物会写入工作区目录，可在此手动删除释放磁盘。
           </p>
         )}
-        {workspaces?.workspaces.map((w) => (
+        {workspaces?.workspaces.map((w) => {
+          const hasCompletedTask = tasks.some(
+            (t) => t.workspace_dir === w.path && t.state === "completed",
+          );
+          return (
           <div key={w.name} className="workspace-row">
             <div className="workspace-main">
               <span className="workspace-name">{w.name}</span>
@@ -638,6 +661,20 @@ export default function App() {
                   继续
                 </button>
               )}
+              {w.reusable && !hasCompletedTask && (
+                <button
+                  className="resume"
+                  disabled={w.busy}
+                  title={
+                    w.busy
+                      ? "任务正在使用该工作区，稍后再进入"
+                      : "复用已完成的分析，进入擦除目标说话人选择"
+                  }
+                  onClick={() => handleOpenWorkspace(w)}
+                >
+                  选择屏蔽人声
+                </button>
+              )}
               <button
                 className="delete"
                 disabled={w.busy}
@@ -653,7 +690,8 @@ export default function App() {
             </div>
             <div className="workspace-path">{w.source_path ?? w.path}</div>
           </div>
-        ))}
+          );
+        })}
       </section>
     </main>
   );
