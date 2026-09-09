@@ -1,4 +1,4 @@
-"""跨视频说话人声纹复用（issue #9）：命名即入库 → 02 自动认人/合并/纠错。
+"""跨视频说话人声纹复用（issue #9）：显式入库 → 02 自动认人/合并/纠错。
 
 装配缝隙走 HTTP TestClient：命名端点、说话人时间轴端点、声纹库端点、擦除
 与阶段清单状态都是外部可观察行为；ML 推理注入 canned 替身。CannedEmbedder
@@ -48,7 +48,7 @@ DEFAULT_TURNS = tuple(
 
 
 class FailingEmbedder(CannedEmbedder):
-    """embed 恒抛错：模拟声纹模型不可用/下载失败的命名即入库失败。"""
+    """embed 恒抛错：模拟声纹模型不可用/下载失败的显式入库失败。"""
 
     def __init__(self, error: Exception):
         super().__init__()
@@ -76,6 +76,12 @@ def rename(client, task_id: str, label: str, name: str):
     return resp.json()
 
 
+def store(client, task_id: str, label: str):
+    resp = client.post(f"/api/tasks/{task_id}/speakers/{label}/voiceprint")
+    assert resp.status_code == 200, resp.text
+    return resp.json()
+
+
 def recognition_of(ws: Path) -> dict:
     return json.loads((ws / "03b-recognize" / "recognition.json").read_text(
         encoding="utf-8"
@@ -86,7 +92,7 @@ def name_of(client, task_id: str, label: str) -> str | None:
     return by_label(speakers_of(client, task_id))[label]["name"]
 
 
-def test_命名即入库_声纹库列表与删除端点(client, tmp_path):
+def test_显式入库_声纹库列表与删除端点(client, tmp_path):
     video = make_video(tmp_path, "第一集.mp4")
     task = run_to_analysis(client, video)
 
@@ -96,6 +102,7 @@ def test_命名即入库_声纹库列表与删除端点(client, tmp_path):
     assert data["names"] == []
 
     rename(client, task["id"], "SPEAKER_00", "男主")
+    store(client, task["id"], "SPEAKER_00")
 
     data = client.get("/api/voiceprints").json()
     assert data["revision"] == 1
@@ -117,13 +124,14 @@ def test_命名即入库_声纹库列表与删除端点(client, tmp_path):
     assert resp.status_code == 404, resp.text
 
 
-def test_入库失败_命名照常生效_响应带出原因(tmp_path):
+def test_入库失败_命名不受影响_响应带出原因(tmp_path):
     embedder = FailingEmbedder(RuntimeError("声纹模型下载失败"))
     with make_client(tmp_path, embedder=embedder) as client:
         video = make_video(tmp_path, "第一集.mp4")
         task = run_to_analysis(client, video)
 
         data = rename(client, task["id"], "SPEAKER_00", "男主")
+        data = store(client, task["id"], "SPEAKER_00")
 
         assert data["voiceprint_error"] == "声纹模型下载失败"
         assert data["name"] == "男主"
@@ -141,6 +149,7 @@ def test_入库成功_响应不带错误(tmp_path):
         task = run_to_analysis(client, video)
 
         data = rename(client, task["id"], "SPEAKER_00", "男主")
+        data = store(client, task["id"], "SPEAKER_00")
 
         assert data["voiceprint_error"] is None
         assert data["name"] == "男主"
@@ -183,6 +192,7 @@ def test_02自动认人_时间轴auto标记_手工名覆盖自动名(tmp_path):
 
         first = run_to_analysis(client, v1)
         rename(client, first["id"], "SPEAKER_00", "男主")
+        store(client, first["id"], "SPEAKER_00")
 
         second = run_to_analysis(client, v2)
         rows = by_label(speakers_of(client, second["id"]))
@@ -218,6 +228,7 @@ def test_同名多簇合并_时间轴一个人_转写与擦除覆盖全部时段
     ) as client:
         first = run_to_analysis(client, v1)
         rename(client, first["id"], "SPEAKER_00", "男主")
+        store(client, first["id"], "SPEAKER_00")
 
     # 02 里同一个人被拆成 SPEAKER_00 与 SPEAKER_02 两个簇
     merge_turns = tuple(
@@ -266,6 +277,7 @@ def test_逐段验证重指派_标错段回到正确人物(tmp_path):
     ) as client:
         first = run_to_analysis(client, v1)
         rename(client, first["id"], "SPEAKER_00", "男主")
+        store(client, first["id"], "SPEAKER_00")
 
     # 02：一段 2 秒的声音被错标成 SPEAKER_01，但其声纹其实是 男主
     reassign_turns = tuple(
@@ -307,6 +319,7 @@ def test_改库后重开_只重跑认人与转写_昂贵阶段零二次调用(tm
     ) as client:
         first = run_to_analysis(client, v1)
         rename(client, first["id"], "SPEAKER_00", "男主")
+        store(client, first["id"], "SPEAKER_00")
 
         second = run_to_analysis(client, v2)
         assert name_of(client, second["id"], "SPEAKER_00") == "男主"
@@ -315,8 +328,9 @@ def test_改库后重开_只重跑认人与转写_昂贵阶段零二次调用(tm
 
         counts_before = call_counts(separator, diarizer, transcriber)
 
-        # 改库：01 里再命名 SPEAKER_01 → 反派，库 revision 递增
+        # 改库：01 里显式存入 SPEAKER_01 → 反派，库 revision 递增
         rename(client, first["id"], "SPEAKER_01", "反派")
+        store(client, first["id"], "SPEAKER_01")
         assert voiceprints.revision(tmp_path / "workspaces") == 2
 
         # 重开 02：只重跑认人/纠错与样本转写

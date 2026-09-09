@@ -1,5 +1,5 @@
 """FastAPI 应用：任务 API（提交/取消/续跑/擦除）+ 音轨探测 + 阶段产物与
-说话人时段试听 + 说话人命名 + 工作区列表与手动删除 + 服务已构建前端。"""
+说话人时段试听 + 说话人命名与显式声纹入库 + 工作区列表与手动删除 + 服务已构建前端。"""
 
 from __future__ import annotations
 
@@ -17,7 +17,7 @@ from fastapi.responses import FileResponse, Response
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
-from . import voiceprints, workspace
+from . import corrections, voiceprints, workspace
 from .inference import Inference, SpeakerSegment
 from .manager import (
     TaskManager,
@@ -64,6 +64,11 @@ class EraseIn(BaseModel):
     output_dir: str | None = None
 
 
+class CorrectionIn(BaseModel):
+    # "__new__" 是 API 协议里的新建说话人；后端会顺延生成 SPEAKER_XX。
+    target: str = Field(min_length=1)
+
+
 def _require_task(manager: TaskManager, task_id: str):
     task = manager.get(task_id)
     if task is None or task.workspace_dir is None:
@@ -97,27 +102,74 @@ def _read_recognition(task) -> dict | None:
         return None
 
 
-def _effective_segments(task, raw: dict) -> list[dict]:
-    """修正后时段：有认人结果用之，否则回退原始说话人分离结果。
+def _diarization_fingerprint(raw: dict) -> str:
+    """当前基础说话人分离的稳定指纹（含人数/模型元数据）。"""
+    return corrections.diarization_fingerprint(
+        raw.get("segments", []),
+        requested_num_speakers=raw.get("requested_num_speakers"),
+        num_speakers=raw.get("num_speakers"),
+        model=raw.get("model"),
+    )
 
-    时间轴、命名与擦除校验统一走这里，保证界面看到的人物与擦除语义一致
-    （spec #9：合并后的同一人物只显示一次，掩码按修正后时段）。
+
+def _correction_snapshot(task, raw: dict) -> tuple[dict | None, str]:
+    """读取人工校正层并计算它相对当前说话人分离的状态。"""
+    snapshot = corrections.read_corrections(Path(task.workspace_dir))
+    base = raw.get("segments", [])
+    fingerprint = _diarization_fingerprint(raw)
+    return snapshot, corrections.snapshot_state(base, snapshot, fingerprint)
+
+
+def _effective_segments(task, raw: dict, snapshot: dict | None) -> list[dict]:
+    """统一生效时段：人工校正 > 认人/纠错 > 原始说话人分离。
+
+    时间轴、命名与擦除校验统一走这里，保证界面看到的人物与擦除语义一致。
     """
     recognition = _read_recognition(task)
-    segments = recognition.get("segments") if recognition else None
-    if isinstance(segments, list):
-        return segments
-    return raw.get("segments", [])
+    return corrections.effective_segments(
+        raw.get("segments", []),
+        recognition,
+        snapshot,
+        _diarization_fingerprint(raw),
+    )
+
+
+def _correction_status(
+    task, snapshot: dict | None, state: str, workspace_busy: bool
+) -> dict:
+    """时间轴使用的校正层元数据：可编辑状态、作废提示与工作区锁定。"""
+    if workspace_busy:
+        return {
+            "state": state,
+            "revision": int((snapshot or {}).get("revision") or 0),
+            "message": None,
+            "editable": False,
+            "locked_reason": "工作区有排队中或运行中的处理任务，编辑已锁定",
+        }
+    if state == "invalidated":
+        return {
+            "state": state,
+            "revision": int((snapshot or {}).get("revision") or 0),
+            "message": "人工校正已作废：说话人分离已重新进行，请放弃作废校正后重新检查",
+            "editable": False,
+            "locked_reason": "人工校正快照已作废，请先放弃作废校正",
+        }
+    return {
+        "state": state,
+        "revision": int((snapshot or {}).get("revision") or 0),
+        "message": None,
+        "editable": True,
+        "locked_reason": None,
+    }
 
 
 def _ingest_voiceprint(
     root: Path, manager, task, label: str, name: str, segments: list[dict]
 ) -> str | None:
-    """命名即入库：从该说话人的样本段（取自人声轨）抽声纹写入全局声纹库。
+    """显式入库：从该说话人的当前生效时段抽声纹写入全局声纹库。
 
-    返回 None 表示入库成功（或本工作区没有可入库的样本段）；返回字符串
-    是用户可读的失败原因——命名照常生效，只是不参与跨视频认人（手工
-    命名永远优先于自动命名），失败原因交由命名响应带回界面展示。
+    返回 None 表示入库成功；返回字符串是用户可读的失败原因——调用方
+    保持其他数据不变，并把原因展示给用户。
     """
     try:
         ws = Path(task.workspace_dir)
@@ -157,8 +209,8 @@ def _ingest_voiceprint(
 def _warmup_embedder(manager: TaskManager) -> None:
     """启动时后台预热声纹模型：门控权重 pip 依赖装不了，只能联网下载。
 
-    提前触发下载，首次命名入库不再卡在权重下载上；失败不阻塞启动，
-    命名照常生效，入库时会带着同样的原因再次尝试（并打印）。
+    提前触发下载，首次显式入库不再卡在权重下载上；失败不阻塞启动，
+    入库时会带着同样的原因再次尝试（并打印）。
     测试注入的 canned 替身没有 load_model，直接跳过。
     """
     embedder = manager.inference.embedder
@@ -174,7 +226,7 @@ def _warmup_embedder(manager: TaskManager) -> None:
             message = str(e) or repr(e)
             print(
                 f"[声纹模型] 预热失败：{message}\n"
-                "[声纹模型] 不影响使用；首次命名入库时会再次尝试下载。",
+                "[声纹模型] 不影响使用；首次显式入库时会再次尝试下载。",
                 flush=True,
             )
 
@@ -259,7 +311,8 @@ def create_app(
                 status_code=409, detail="任务正在排队或运行中，无法发起擦除"
             )
         raw = _load_diarization(task)
-        segments = _effective_segments(task, raw)
+        correction_snapshot, _state = _correction_snapshot(task, raw)
+        segments = _effective_segments(task, raw, correction_snapshot)
         known = {s["speaker"] for s in segments}
         unknown = sorted({s for s in body.speakers if s not in known})
         if unknown:
@@ -426,28 +479,25 @@ def create_app(
             "tracks": tracks,
         }
 
-    @app.get("/api/tasks/{task_id}/diarization")
-    def get_diarization(task_id: str):
-        """说话人时间轴数据：按"修正后时段"分组的说话人（认人/纠错后）。
-
-        合并后的同一人物只显示一次；名字 = 手工命名 ?? 自动命名 ?? null；
-        带 auto 标记（是否自动认出来的），界面据此显示「自动」徽标。
-        """
-        task = _require_task(manager, task_id)
+    def _timeline_payload(task) -> dict:
         raw = _load_diarization(task)
-        segments = _effective_segments(task, raw)
+        snapshot, state = _correction_snapshot(task, raw)
+        segments = _effective_segments(task, raw, snapshot)
         turns = [
-            (s["speaker"], float(s["start"]), float(s["end"]))
-            for s in segments
+            {"speaker": s["speaker"], "start": float(s["start"]), "end": float(s["end"]), "index": i}
+            for i, s in enumerate(segments)
         ]
-        turns.sort(key=lambda t: t[1])
+        turns.sort(key=lambda t: t["start"])
         speakers: dict[str, dict] = {}
-        for label, start, end in turns:
+        for turn in turns:
             sp = speakers.setdefault(
-                label, {"label": label, "speech_time": 0.0, "segments": []}
+                turn["speaker"],
+                {"label": turn["speaker"], "speech_time": 0.0, "segments": []},
             )
-            sp["speech_time"] += end - start
-            sp["segments"].append({"start": start, "end": end})
+            sp["speech_time"] += turn["end"] - turn["start"]
+            sp["segments"].append(
+                {"start": turn["start"], "end": turn["end"], "index": turn["index"]}
+            )
         names = workspace.read_speaker_names(Path(task.workspace_dir))
         recognition = _read_recognition(task)
         auto_names = {
@@ -468,21 +518,74 @@ def create_app(
         return {
             "model": raw.get("model"),
             "num_speakers": len(rows),
-            "duration": max((e for _, _, e in turns), default=0.0),
+            "duration": max((t["end"] for t in turns), default=0.0),
             "speakers": rows,
+            "correction": _correction_status(
+                task, snapshot, state, manager.workspace_busy(str(task.workspace_dir))
+            ),
         }
+
+    @app.get("/api/tasks/{task_id}/diarization")
+    def get_diarization(task_id: str):
+        """说话人时间轴数据：按生效时段分组的说话人（人工校正优先）。"""
+        task = _require_task(manager, task_id)
+        return _timeline_payload(task)
+
+    @app.put("/api/tasks/{task_id}/segments/{segment_index}/speaker")
+    def reassign_segment(task_id: str, segment_index: int, body: CorrectionIn):
+        """人工改派一个时段：立即保存完整生效时段快照到工作区。"""
+        task = _require_task(manager, task_id)
+        raw = _load_diarization(task)
+        snapshot, state = _correction_snapshot(task, raw)
+        status = _correction_status(
+            task, snapshot, state, manager.workspace_busy(str(task.workspace_dir))
+        )
+        if not status["editable"]:
+            raise HTTPException(status_code=409, detail=status["locked_reason"])
+        try:
+            updated = corrections.apply_reassignment(
+                raw.get("segments", []),
+                snapshot,
+                segment_index,
+                body.target,
+                _diarization_fingerprint(raw),
+            )
+            corrections.write_corrections(Path(task.workspace_dir), updated)
+        except ValueError as e:
+            message = str(e)
+            status_code = 400 if message == "该时段已属于目标说话人" else 404
+            raise HTTPException(status_code=status_code, detail=message)
+        return _timeline_payload(task)
+
+    @app.delete("/api/tasks/{task_id}/corrections")
+    def discard_corrections(task_id: str):
+        """放弃全部人工校正：删除快照，回到自动分析结果。"""
+        task = _require_task(manager, task_id)
+        raw = _load_diarization(task)
+        snapshot, state = _correction_snapshot(task, raw)
+        status = _correction_status(
+            task, snapshot, state, manager.workspace_busy(str(task.workspace_dir))
+        )
+        if manager.workspace_busy(str(task.workspace_dir)):
+            raise HTTPException(status_code=409, detail=status["locked_reason"])
+        corrections.discard(Path(task.workspace_dir))
+        return _timeline_payload(task)
 
     @app.put("/api/tasks/{task_id}/speakers/{label}/name")
     def rename_speaker(task_id: str, label: str, body: SpeakerNameIn):
-        """命名/改名/清除：写入工作区元数据，随工作区存续，不强制唯一。
+        """命名/改名/清除：纯本地写入工作区元数据，不触碰声纹库。
 
-        非空命名写名后同步对该名字入库（从该说话人的样本段抽声纹写入全局
-        声纹库，跨视频累积）；空名只清手工命名、不动库（spec #9）。
-        入库失败不影响命名本身，失败原因经 voiceprint_error 带回界面。
+        名字随工作区存续且不强制唯一；声纹库只经显式入库端点变化。
         """
         task = _require_task(manager, task_id)
         raw = _load_diarization(task)
-        segments = _effective_segments(task, raw)
+        snapshot, state = _correction_snapshot(task, raw)
+        status = _correction_status(
+            task, snapshot, state, manager.workspace_busy(str(task.workspace_dir))
+        )
+        if not status["editable"]:
+            raise HTTPException(status_code=409, detail=status["locked_reason"])
+        segments = _effective_segments(task, raw, snapshot)
         known = {s["speaker"] for s in segments}
         if label not in known:
             raise HTTPException(status_code=404, detail="说话人不存在")
@@ -494,15 +597,37 @@ def create_app(
         else:
             names.pop(label, None)  # 空白名字 = 清除命名，界面回退编号标签
         workspace.write_speaker_names(ws, names)
-        voiceprint_error = None
-        if name:
-            voiceprint_error = _ingest_voiceprint(
-                root, manager, task, label, name, segments
-            )
+        return {"label": label, "name": name or None}
+
+    @app.post("/api/tasks/{task_id}/speakers/{label}/voiceprint")
+    def store_speaker_voiceprint(task_id: str, label: str):
+        """显式存入声纹库：按当前生效时段抽样，同名人物追加向量。
+
+        入库失败只影响本次跨视频复用；改名等本地操作与工作区数据保持
+        不变，失败原因经 voiceprint_error 带回界面展示。
+        """
+        task = _require_task(manager, task_id)
+        raw = _load_diarization(task)
+        correction_snapshot, _state = _correction_snapshot(task, raw)
+        segments = _effective_segments(task, raw, correction_snapshot)
+        known = {s["speaker"] for s in segments}
+        if label not in known:
+            raise HTTPException(status_code=404, detail="说话人不存在")
+        ws = Path(task.workspace_dir)
+        recognition = _read_recognition(task)
+        auto_names = (
+            {str(k): str(v) for k, v in (recognition.get("mapping") or {}).items()}
+            if recognition
+            else {}
+        )
+        name = workspace.read_speaker_names(ws).get(label) or auto_names.get(label)
+        if not name:
+            raise HTTPException(status_code=400, detail="请先命名说话人，再存入声纹库")
+        error = _ingest_voiceprint(root, manager, task, label, name, segments)
         return {
             "label": label,
-            "name": name or None,
-            "voiceprint_error": voiceprint_error,
+            "name": name,
+            "voiceprint_error": error,
         }
 
     @app.get("/api/tasks/{task_id}/transcripts")

@@ -71,8 +71,11 @@ def test_时间轴端点返回按说话人分组的时段(client, tmp_path):
     assert [s["label"] for s in data["speakers"]] == ["SPEAKER_00", "SPEAKER_01"]
     sp0 = data["speakers"][0]
     assert sp0["speech_time"] == 1.2, "SPEAKER_00 总说话时长应为 0.7 + 0.5"
-    assert sp0["segments"] == [{"start": 0.2, "end": 0.9}, {"start": 1.3, "end": 1.8}]
-    assert data["speakers"][1]["segments"] == [{"start": 0.95, "end": 1.25}]
+    assert sp0["segments"] == [
+        {"start": 0.2, "end": 0.9, "index": 0},
+        {"start": 1.3, "end": 1.8, "index": 2},
+    ]
+    assert data["speakers"][1]["segments"] == [{"start": 0.95, "end": 1.25, "index": 1}]
 
 
 def test_时间轴端点拒绝未知任务与未完成任务(tmp_path):
