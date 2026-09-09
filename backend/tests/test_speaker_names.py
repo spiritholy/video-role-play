@@ -38,7 +38,11 @@ def test_命名写入工作区元数据且时间轴即时可见(client, tmp_path
 
     resp = rename(client, task["id"], "SPEAKER_00", "男主")
     assert resp.status_code == 200, resp.text
-    assert resp.json() == {"label": "SPEAKER_00", "name": "男主"}
+    assert resp.json() == {
+        "label": "SPEAKER_00",
+        "name": "男主",
+        "voiceprint_error": None,
+    }
 
     ws = tmp_path / "workspaces" / "命名"
     stored = json.loads((ws / "speaker_names.json").read_text(encoding="utf-8"))

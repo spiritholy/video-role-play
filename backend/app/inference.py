@@ -530,11 +530,16 @@ class PyannoteEmbedder:
         on_progress: ProgressCallback,
     ) -> tuple[list[float], ...]:
         inference = self.load_model()
+        # Inference.crop 只认 pyannote.core.Segment（内部访问 .start/.end），
+        # 不能传 [start, end] 裸列表；pyannote.audio 是重依赖，按本模块惯例
+        # 延迟到首次使用才 import（pyannote.core 很轻，但保持同一模式）。
+        from pyannote.core import Segment
+
         vectors: list[list[float]] = []
         total = max(1, len(windows))
         for i, (start, end) in enumerate(windows):
             try:
-                vec = inference.crop(str(wav), [start, end])
+                vec = inference.crop(str(wav), Segment(start, end))
             except (TaskCancelled, TaskError):
                 raise
             except Exception as e:

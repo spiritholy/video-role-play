@@ -47,6 +47,17 @@ DEFAULT_TURNS = tuple(
 )
 
 
+class FailingEmbedder(CannedEmbedder):
+    """embed 恒抛错：模拟声纹模型不可用/下载失败的命名即入库失败。"""
+
+    def __init__(self, error: Exception):
+        super().__init__()
+        self._error = error
+
+    def embed(self, wav, windows, on_progress):
+        raise self._error
+
+
 def speakers_of(client, task_id: str) -> list[dict]:
     resp = client.get(f"/api/tasks/{task_id}/diarization")
     assert resp.status_code == 200, resp.text
@@ -104,6 +115,64 @@ def test_命名即入库_声纹库列表与删除端点(client, tmp_path):
 
     resp = client.delete("/api/voiceprints/男主")
     assert resp.status_code == 404, resp.text
+
+
+def test_入库失败_命名照常生效_响应带出原因(tmp_path):
+    embedder = FailingEmbedder(RuntimeError("声纹模型下载失败"))
+    with make_client(tmp_path, embedder=embedder) as client:
+        video = make_video(tmp_path, "第一集.mp4")
+        task = run_to_analysis(client, video)
+
+        data = rename(client, task["id"], "SPEAKER_00", "男主")
+
+        assert data["voiceprint_error"] == "声纹模型下载失败"
+        assert data["name"] == "男主"
+        assert name_of(client, task["id"], "SPEAKER_00") == "男主"
+
+        data = client.get("/api/voiceprints").json()
+        assert data["revision"] == 0
+        assert data["names"] == []
+
+
+def test_入库成功_响应不带错误(tmp_path):
+    embedder = CannedEmbedder(regions=TWO_SPEAKER_REGIONS)
+    with make_client(tmp_path, embedder=embedder) as client:
+        video = make_video(tmp_path, "第一集.mp4")
+        task = run_to_analysis(client, video)
+
+        data = rename(client, task["id"], "SPEAKER_00", "男主")
+
+        assert data["voiceprint_error"] is None
+        assert data["name"] == "男主"
+        lib = client.get("/api/voiceprints").json()
+        assert lib["revision"] == 1
+        assert [(n["name"], n["vectors_count"]) for n in lib["names"]] == [("男主", 2)]
+
+
+def test_启动预热_声纹模型后台加载(tmp_path):
+    class TrackingEmbedder(CannedEmbedder):
+        def __init__(self):
+            super().__init__()
+            self.loaded = False
+
+        def load_model(self):
+            self.loaded = True
+
+    embedder = TrackingEmbedder()
+    with make_client(tmp_path, embedder=embedder) as client:
+        wait_for(lambda: embedder.loaded)
+        assert client.get("/api/voiceprints").status_code == 200
+
+
+def test_预热失败_不阻塞启动(tmp_path):
+    class ExplodingEmbedder(CannedEmbedder):
+        def load_model(self):
+            raise RuntimeError("声纹模型下载失败")
+
+    with make_client(tmp_path, embedder=ExplodingEmbedder()) as client:
+        resp = client.get("/api/voiceprints")
+        assert resp.status_code == 200
+        assert resp.json()["revision"] == 0
 
 
 def test_02自动认人_时间轴auto标记_手工名覆盖自动名(tmp_path):

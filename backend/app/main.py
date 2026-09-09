@@ -6,6 +6,8 @@ from __future__ import annotations
 import json
 import mimetypes
 import os
+import sys
+import threading
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Callable
@@ -110,21 +112,22 @@ def _effective_segments(task, raw: dict) -> list[dict]:
 
 def _ingest_voiceprint(
     root: Path, manager, task, label: str, name: str, segments: list[dict]
-) -> None:
+) -> str | None:
     """命名即入库：从该说话人的样本段（取自人声轨）抽声纹写入全局声纹库。
 
-    空名字只清手工命名、不动库；入库失败静默跳过（无缝回退：命名照常
-    生效，只是不参与跨视频认人）——手工命名永远优先于自动命名。
+    返回 None 表示入库成功（或本工作区没有可入库的样本段）；返回字符串
+    是用户可读的失败原因——命名照常生效，只是不参与跨视频认人（手工
+    命名永远优先于自动命名），失败原因交由命名响应带回界面展示。
     """
     try:
         ws = Path(task.workspace_dir)
         manifest = workspace.read_manifest(ws) or {}
         vocal_rel = (manifest.get("separation") or {}).get("vocal")
         if not vocal_rel:
-            return
+            return "工作区缺少人声轨产物，无法抽取声纹入库"
         vocal_path = ws / vocal_rel
         if not vocal_path.is_file():
-            return
+            return "人声轨产物文件缺失，无法抽取声纹入库"
         turns = [
             SpeakerSegment(s["speaker"], float(s["start"]), float(s["end"]))
             for s in segments
@@ -142,9 +145,40 @@ def _ingest_voiceprint(
             model=manager.inference.embedder.name,
             source_workspace=ws.name,
         )
-    except Exception:
-        # 声纹模型不可用/抽声纹失败：不影响命名，库保持原样
+        return None
+    except Exception as e:
+        # 声纹模型不可用/抽声纹失败：不影响命名，库保持原样；
+        # 失败原因带回命名响应（界面展示），并打到后端控制台便于排查。
+        message = str(e) or repr(e)
+        print(f"[声纹入库] 失败：{message}", file=sys.stderr, flush=True)
+        return message
+
+
+def _warmup_embedder(manager: TaskManager) -> None:
+    """启动时后台预热声纹模型：门控权重 pip 依赖装不了，只能联网下载。
+
+    提前触发下载，首次命名入库不再卡在权重下载上；失败不阻塞启动，
+    命名照常生效，入库时会带着同样的原因再次尝试（并打印）。
+    测试注入的 canned 替身没有 load_model，直接跳过。
+    """
+    embedder = manager.inference.embedder
+    if not hasattr(embedder, "load_model"):
         return
+    name = getattr(embedder, "name", type(embedder).__name__)
+
+    def run():
+        try:
+            embedder.load_model()
+            print(f"[声纹模型] {name} 已就绪（权重已缓存）", flush=True)
+        except Exception as e:
+            message = str(e) or repr(e)
+            print(
+                f"[声纹模型] 预热失败：{message}\n"
+                "[声纹模型] 不影响使用；首次命名入库时会再次尝试下载。",
+                flush=True,
+            )
+
+    threading.Thread(target=run, name="voiceprint-warmup", daemon=True).start()
 
 
 def create_app(
@@ -160,6 +194,7 @@ def create_app(
     @asynccontextmanager
     async def lifespan(_app: FastAPI):
         manager.start()
+        _warmup_embedder(manager)
         if on_start is not None:
             on_start()
         yield
@@ -443,6 +478,7 @@ def create_app(
 
         非空命名写名后同步对该名字入库（从该说话人的样本段抽声纹写入全局
         声纹库，跨视频累积）；空名只清手工命名、不动库（spec #9）。
+        入库失败不影响命名本身，失败原因经 voiceprint_error 带回界面。
         """
         task = _require_task(manager, task_id)
         raw = _load_diarization(task)
@@ -458,9 +494,16 @@ def create_app(
         else:
             names.pop(label, None)  # 空白名字 = 清除命名，界面回退编号标签
         workspace.write_speaker_names(ws, names)
+        voiceprint_error = None
         if name:
-            _ingest_voiceprint(root, manager, task, label, name, segments)
-        return {"label": label, "name": name or None}
+            voiceprint_error = _ingest_voiceprint(
+                root, manager, task, label, name, segments
+            )
+        return {
+            "label": label,
+            "name": name or None,
+            "voiceprint_error": voiceprint_error,
+        }
 
     @app.get("/api/tasks/{task_id}/transcripts")
     def get_transcripts(task_id: str):

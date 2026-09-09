@@ -184,6 +184,8 @@ export default function App() {
     Record<string, Record<string, string>>
   >({});
   const [transcripts, setTranscripts] = useState<Record<string, TranscriptsOrError>>({});
+  // 命名入库失败警告（任务 → 文案）：仅前端会话态，下次命名成功或刷新即清除。
+  const [ingestWarnings, setIngestWarnings] = useState<Record<string, string | null>>({});
   const [playing, setPlaying] = useState<Playing | null>(null);
   const audioRef = useRef<HTMLAudioElement | null>(null);
   const requestedTimelines = useRef<Set<string>>(new Set());
@@ -243,7 +245,17 @@ export default function App() {
           },
         );
         if (!resp.ok) return undefined;
-        const data: { label: string; name: string | null } = await resp.json();
+        const data: {
+          label: string;
+          name: string | null;
+          voiceprint_error?: string | null;
+        } = await resp.json();
+        setIngestWarnings((prev) => ({
+          ...prev,
+          [task.id]: data.voiceprint_error
+            ? `命名已保存，但声纹入库失败：${data.voiceprint_error}`
+            : null,
+        }));
         setSpeakerNames((prev) => {
           const forWs = { ...(prev[wsKey] ?? {}) };
           if (data.name) forWs[label] = data.name;
@@ -528,6 +540,7 @@ export default function App() {
       }
     }
 
+    const ingestWarning = ingestWarnings[t.id];
     return (
       <>
         <SpeakerTimeline
@@ -540,6 +553,7 @@ export default function App() {
           onPlay={playSegment}
           onRename={(label, name) => renameSpeaker(t, label, name)}
         />
+        {ingestWarning && <p className="error-text">{ingestWarning}</p>}
         {t.state === "completed" && (
           <EraseForm
             task={t}

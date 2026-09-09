@@ -24,11 +24,8 @@ from pathlib import Path
 REPO_ROOT = Path(__file__).resolve().parent
 sys.path.insert(0, str(REPO_ROOT / "backend"))
 
-import uvicorn  # noqa: E402
-
-from app.envfile import load_env_file  # noqa: E402
-from app.main import create_app  # noqa: E402
-from app.ports import ATTEMPTS, DEFAULT_PORT, PortUnavailable, choose_port  # noqa: E402
+from app.envfile import load_env_file  # 轻量模块：只依赖标准库
+from app.ports import ATTEMPTS, DEFAULT_PORT, PortUnavailable, choose_port  # 轻量：纯标准库
 
 # 说话人分离的 HF token 候选变量（与 inference.HF_TOKEN_VARS 同一组约定）
 HF_TOKEN_VARS = ("HF_TOKEN", "HUGGINGFACE_TOKEN")
@@ -63,10 +60,16 @@ def main() -> None:
     )
     args = parser.parse_args()
 
-    # 必须先于 create_app 与端口选择：工作区根目录、VRP_PORT 都在环境变量里
+    # 必须先于 uvicorn/app.main 导入：huggingface_hub 在 import 时就读取
+    # HF_ENDPOINT（镜像）等变量，.env 里的这些键要赶在重依赖之前注入；
+    # 工作区根目录、VRP_PORT 同样在环境变量里。
     loaded = load_env_file(Path(args.env_file))
     if loaded:
         print(f"[env] 已从 {args.env_file} 注入：{', '.join(loaded)}")
+
+    import uvicorn  # noqa: E402  延后导入：让 .env 的 HF_ENDPOINT 赶在 huggingface_hub 之前注入
+
+    from app.main import create_app  # noqa: E402
     if not any(os.environ.get(var) for var in HF_TOKEN_VARS):
         print(
             "[warn] 未配置 HF token：任务会在「说话人分离」阶段失败；"
