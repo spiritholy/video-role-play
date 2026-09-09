@@ -160,7 +160,7 @@ class DemucsSeparator:
                 from demucs.api import Separator
             except ImportError as e:
                 raise TaskError(
-                    "缺少依赖 demucs/torch：请先安装 backend/requirements.txt"
+                    "缺少依赖 demucs/torch：请在 backend 目录运行 uv sync"
                 ) from e
             self._separator_factory = (
                 lambda: Separator(model=self._model_name, device="cpu")
@@ -370,7 +370,7 @@ class PyannoteDiarizer:
             from pyannote.audio import Pipeline
         except ImportError as e:
             raise TaskError(
-                "缺少依赖 pyannote.audio：请先安装 backend/requirements.txt"
+                "缺少依赖 pyannote.audio：请在 backend 目录运行 uv sync"
             ) from e
         return Pipeline.from_pretrained(
             model_id, use_auth_token=token, cache_dir=cache_dir
@@ -410,7 +410,7 @@ class WhisperTranscriber:
                 from faster_whisper import WhisperModel
             except ImportError as e:
                 raise TaskError(
-                    "缺少依赖 faster-whisper：请先安装 backend/requirements.txt"
+                    "缺少依赖 faster-whisper：请在 backend 目录运行 uv sync"
                 ) from e
             self._model_factory = lambda: WhisperModel(
                 self._model_name, device="cpu", compute_type="int8"
@@ -434,7 +434,7 @@ class WhisperTranscriber:
             from faster_whisper.audio import decode_audio
         except ImportError as e:
             raise TaskError(
-                "缺少依赖 faster-whisper：请先安装 backend/requirements.txt"
+                "缺少依赖 faster-whisper：请在 backend 目录运行 uv sync"
             ) from e
         return decode_audio(str(wav), sampling_rate=WHISPER_SAMPLE_RATE)
 
@@ -559,7 +559,7 @@ class PyannoteEmbedder:
             from pyannote.audio import Inference, Model
         except ImportError as e:
             raise TaskError(
-                "缺少依赖 pyannote.audio：请先安装 backend/requirements.txt"
+                "缺少依赖 pyannote.audio：请在 backend 目录运行 uv sync"
             ) from e
         model = Model.from_pretrained(
             model_id, use_auth_token=token, cache_dir=cache_dir

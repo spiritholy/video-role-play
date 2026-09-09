@@ -5,24 +5,18 @@ cd "$(dirname "$0")"
 
 VENV_PY="backend/.venv/bin/python"
 
-if [ ! -x "$VENV_PY" ]; then
-  echo "[setup] 创建 Python 虚拟环境…"
-  python3 -m venv backend/.venv
-fi
-
-if ! "$VENV_PY" -c "import fastapi, uvicorn, httpx" 2>/dev/null; then
-  echo "[setup] 安装后端依赖…"
-  "$VENV_PY/bin/pip" install -r backend/requirements.txt \
-    || "$VENV_PY/bin/pip" install -r backend/requirements.txt \
-      -i https://pypi.tuna.tsinghua.edu.cn/simple
+echo "[setup] 同步后端依赖（uv sync）…"
+if ! uv sync --project backend; then
+  echo "[setup] 直连 PyPI 失败，改用清华镜像重试…"
+  UV_DEFAULT_INDEX=https://pypi.tuna.tsinghua.edu.cn/simple uv sync --project backend
 fi
 
 if [ ! -f frontend/dist/index.html ]; then
   echo "[setup] 构建前端…"
   if [ ! -d frontend/node_modules ]; then
-    (cd frontend && npm install)
+    (cd frontend && pnpm install)
   fi
-  (cd frontend && npm run build)
+  (cd frontend && pnpm run build)
 fi
 
 # HF token 预检：pyannote 是门控模型，缺 token 会白跑几小时才撞上失败。
