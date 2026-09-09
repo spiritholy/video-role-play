@@ -41,7 +41,6 @@ def test_命名写入工作区元数据且时间轴即时可见(client, tmp_path
     assert resp.json() == {
         "label": "SPEAKER_00",
         "name": "男主",
-        "voiceprint_error": None,
     }
 
     ws = tmp_path / "workspaces" / "命名"

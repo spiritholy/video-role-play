@@ -186,6 +186,7 @@ export default function App() {
   const [transcripts, setTranscripts] = useState<Record<string, TranscriptsOrError>>({});
   // 命名入库失败警告（任务 → 文案）：仅前端会话态，下次命名成功或刷新即清除。
   const [ingestWarnings, setIngestWarnings] = useState<Record<string, string | null>>({});
+  const [voiceprintBusy, setVoiceprintBusy] = useState<Record<string, boolean>>({});
   const [playing, setPlaying] = useState<Playing | null>(null);
   const audioRef = useRef<HTMLAudioElement | null>(null);
   const requestedTimelines = useRef<Set<string>>(new Set());
@@ -245,17 +246,8 @@ export default function App() {
           },
         );
         if (!resp.ok) return undefined;
-        const data: {
-          label: string;
-          name: string | null;
-          voiceprint_error?: string | null;
-        } = await resp.json();
-        setIngestWarnings((prev) => ({
-          ...prev,
-          [task.id]: data.voiceprint_error
-            ? `命名已保存，但声纹入库失败：${data.voiceprint_error}`
-            : null,
-        }));
+        const data: { label: string; name: string | null } = await resp.json();
+        setIngestWarnings((prev) => ({ ...prev, [task.id]: null }));
         setSpeakerNames((prev) => {
           const forWs = { ...(prev[wsKey] ?? {}) };
           if (data.name) forWs[label] = data.name;
@@ -486,6 +478,56 @@ export default function App() {
     refresh();
   }
 
+  async function handleStoreVoiceprint(task: Task, label: string) {
+    const key = `${task.id}:${label}`;
+    if (voiceprintBusy[key]) return;
+    const timeline = timelines[task.id];
+    const speaker =
+      timeline === "error" || timeline === undefined
+        ? undefined
+        : timeline.speakers.find((sp) => sp.label === label);
+    const name =
+      speakerNames[workspaceKey(task)]?.[label] ?? speaker?.name ?? null;
+    if (!name) {
+      setIngestWarnings((prev) => ({
+        ...prev,
+        [task.id]: "请先命名说话人，再存入声纹库",
+      }));
+      return;
+    }
+
+    setVoiceprintBusy((prev) => ({ ...prev, [key]: true }));
+    setIngestWarnings((prev) => ({ ...prev, [task.id]: null }));
+    try {
+      const resp = await fetch(
+        `/api/tasks/${task.id}/speakers/${encodeURIComponent(label)}/voiceprint`,
+        { method: "POST" },
+      );
+      const data = await resp.json().catch(() => null);
+      if (!resp.ok) {
+        setIngestWarnings((prev) => ({
+          ...prev,
+          [task.id]: data?.detail ?? "存入声纹库失败",
+        }));
+        return;
+      }
+      setIngestWarnings((prev) => ({
+        ...prev,
+        [task.id]: data?.voiceprint_error
+          ? `声纹入库失败：${data.voiceprint_error}`
+          : null,
+      }));
+    } catch {
+      setIngestWarnings((prev) => ({
+        ...prev,
+        [task.id]: "无法连接后端服务",
+      }));
+    } finally {
+      setVoiceprintBusy((prev) => ({ ...prev, [key]: false }));
+      refreshVoiceprints();
+    }
+  }
+
   async function handleDeleteVoiceprint(name: string) {
     const confirmed = window.confirm(
       `从声纹库删除「${name}」？\n\n后续剧集将不再自动识别该人物。`,
@@ -552,6 +594,8 @@ export default function App() {
           playing={playing}
           onPlay={playSegment}
           onRename={(label, name) => renameSpeaker(t, label, name)}
+          onStoreVoiceprint={(label) => handleStoreVoiceprint(t, label)}
+          voiceprintBusy={(rowLabel) => Boolean(voiceprintBusy[`${t.id}:${rowLabel}`])}
         />
         {ingestWarning && <p className="error-text">{ingestWarning}</p>}
         {t.state === "completed" && (
@@ -721,12 +765,12 @@ export default function App() {
             )}
           </div>
           <p className="voiceprint-hint">
-            给说话人命名时自动抽取声纹入库，后续剧集据此自动认人/纠错（带「自动」标记，
-            手工命名永远优先）。误入库的人物可在此删除。
+            在说话人列表中显式存入声纹，后续剧集据此自动认人/纠错（带「自动」标记，
+            手工命名永远优先）。同名人物再次存入会追加声纹。误入库的人物可在此删除。
           </p>
           {voiceprintError && <p className="error-text">{voiceprintError}</p>}
           {voiceprints && voiceprints.names.length === 0 && (
-            <p className="empty">声纹库为空。命名一个说话人后会自动存入。</p>
+            <p className="empty">声纹库为空。在说话人列表中显式存入声纹。</p>
           )}
           {voiceprints?.names.map((n) => (
             <div key={n.name} className="voiceprint-row">
@@ -922,6 +966,8 @@ function SpeakerTimeline({
   playing,
   onPlay,
   onRename,
+  onStoreVoiceprint,
+  voiceprintBusy,
 }: {
   taskId: string;
   timeline: Timeline;
@@ -931,6 +977,8 @@ function SpeakerTimeline({
   playing: Playing | null;
   onPlay: (taskId: string, speaker: string, seg: TimelineSegment) => void;
   onRename: (label: string, name: string) => Promise<string | null | undefined>;
+  onStoreVoiceprint: (label: string) => Promise<void>;
+  voiceprintBusy: (label: string) => boolean;
 }) {
   const pct = (v: number) => `${((v / timeline.duration) * 100).toFixed(3)}%`;
   const shown = (sp: TimelineSpeaker) => names[sp.label] ?? sp.name ?? sp.label;
@@ -961,6 +1009,15 @@ function SpeakerTimeline({
                 onRename={onRename}
               />
               <span className="speech-time">{fmtTime(sp.speech_time)}</span>
+              <button
+                type="button"
+                className="store-voiceprint"
+                disabled={voiceprintBusy(sp.label)}
+                title={`从 ${shown(sp)} 的当前生效时段抽取声纹并存入声纹库`}
+                onClick={() => void onStoreVoiceprint(sp.label)}
+              >
+                {voiceprintBusy(sp.label) ? "存入中…" : "存入声纹库"}
+              </button>
             </span>
             <div className="timeline-track">
               {sp.segments.map((seg, i) => (

@@ -1,5 +1,5 @@
 """FastAPI 应用：任务 API（提交/取消/续跑/擦除）+ 音轨探测 + 阶段产物与
-说话人时段试听 + 说话人命名 + 工作区列表与手动删除 + 服务已构建前端。"""
+说话人时段试听 + 说话人命名与显式声纹入库 + 工作区列表与手动删除 + 服务已构建前端。"""
 
 from __future__ import annotations
 
@@ -113,11 +113,10 @@ def _effective_segments(task, raw: dict) -> list[dict]:
 def _ingest_voiceprint(
     root: Path, manager, task, label: str, name: str, segments: list[dict]
 ) -> str | None:
-    """命名即入库：从该说话人的样本段（取自人声轨）抽声纹写入全局声纹库。
+    """显式入库：从该说话人的当前生效时段抽声纹写入全局声纹库。
 
-    返回 None 表示入库成功（或本工作区没有可入库的样本段）；返回字符串
-    是用户可读的失败原因——命名照常生效，只是不参与跨视频认人（手工
-    命名永远优先于自动命名），失败原因交由命名响应带回界面展示。
+    返回 None 表示入库成功；返回字符串是用户可读的失败原因——调用方
+    保持其他数据不变，并把原因展示给用户。
     """
     try:
         ws = Path(task.workspace_dir)
@@ -157,8 +156,8 @@ def _ingest_voiceprint(
 def _warmup_embedder(manager: TaskManager) -> None:
     """启动时后台预热声纹模型：门控权重 pip 依赖装不了，只能联网下载。
 
-    提前触发下载，首次命名入库不再卡在权重下载上；失败不阻塞启动，
-    命名照常生效，入库时会带着同样的原因再次尝试（并打印）。
+    提前触发下载，首次显式入库不再卡在权重下载上；失败不阻塞启动，
+    入库时会带着同样的原因再次尝试（并打印）。
     测试注入的 canned 替身没有 load_model，直接跳过。
     """
     embedder = manager.inference.embedder
@@ -174,7 +173,7 @@ def _warmup_embedder(manager: TaskManager) -> None:
             message = str(e) or repr(e)
             print(
                 f"[声纹模型] 预热失败：{message}\n"
-                "[声纹模型] 不影响使用；首次命名入库时会再次尝试下载。",
+                "[声纹模型] 不影响使用；首次显式入库时会再次尝试下载。",
                 flush=True,
             )
 
@@ -474,11 +473,9 @@ def create_app(
 
     @app.put("/api/tasks/{task_id}/speakers/{label}/name")
     def rename_speaker(task_id: str, label: str, body: SpeakerNameIn):
-        """命名/改名/清除：写入工作区元数据，随工作区存续，不强制唯一。
+        """命名/改名/清除：纯本地写入工作区元数据，不触碰声纹库。
 
-        非空命名写名后同步对该名字入库（从该说话人的样本段抽声纹写入全局
-        声纹库，跨视频累积）；空名只清手工命名、不动库（spec #9）。
-        入库失败不影响命名本身，失败原因经 voiceprint_error 带回界面。
+        名字随工作区存续且不强制唯一；声纹库只经显式入库端点变化。
         """
         task = _require_task(manager, task_id)
         raw = _load_diarization(task)
@@ -494,15 +491,36 @@ def create_app(
         else:
             names.pop(label, None)  # 空白名字 = 清除命名，界面回退编号标签
         workspace.write_speaker_names(ws, names)
-        voiceprint_error = None
-        if name:
-            voiceprint_error = _ingest_voiceprint(
-                root, manager, task, label, name, segments
-            )
+        return {"label": label, "name": name or None}
+
+    @app.post("/api/tasks/{task_id}/speakers/{label}/voiceprint")
+    def store_speaker_voiceprint(task_id: str, label: str):
+        """显式存入声纹库：按当前生效时段抽样，同名人物追加向量。
+
+        入库失败只影响本次跨视频复用；改名等本地操作与工作区数据保持
+        不变，失败原因经 voiceprint_error 带回界面展示。
+        """
+        task = _require_task(manager, task_id)
+        raw = _load_diarization(task)
+        segments = _effective_segments(task, raw)
+        known = {s["speaker"] for s in segments}
+        if label not in known:
+            raise HTTPException(status_code=404, detail="说话人不存在")
+        ws = Path(task.workspace_dir)
+        recognition = _read_recognition(task)
+        auto_names = (
+            {str(k): str(v) for k, v in (recognition.get("mapping") or {}).items()}
+            if recognition
+            else {}
+        )
+        name = workspace.read_speaker_names(ws).get(label) or auto_names.get(label)
+        if not name:
+            raise HTTPException(status_code=400, detail="请先命名说话人，再存入声纹库")
+        error = _ingest_voiceprint(root, manager, task, label, name, segments)
         return {
             "label": label,
-            "name": name or None,
-            "voiceprint_error": voiceprint_error,
+            "name": name,
+            "voiceprint_error": error,
         }
 
     @app.get("/api/tasks/{task_id}/transcripts")

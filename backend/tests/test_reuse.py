@@ -100,9 +100,8 @@ def test_同源第二个任务继承命名并用于成品命名(tmp_path):
         )
 
         done = erase_to_completion(client, second["id"], ["SPEAKER_00"])
-        # 命名即入库使库 revision 递增，认人产物失效：第二个任务只重跑
-        # 认人/纠错与样本转写，昂贵的音轨提取/分离/说话人分离仍零二次调用
-        assert call_counts(separator, diarizer, transcriber) == (1, 1, 2)
+        # 纯命名不改声纹库、认人产物不失效：同源新任务复用全部分析产物
+        assert call_counts(separator, diarizer, transcriber) == (1, 1, 1)
         assert done["output_path"] == str(video.with_name("继承__erased-男主.mp4")), (
             "继承的命名应可用于成品命名"
         )
