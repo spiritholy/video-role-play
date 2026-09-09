@@ -713,6 +713,31 @@ button.delete {
   background: #fff;
 }
 
+.timeline-edge {
+  position: absolute;
+  top: -3px;
+  bottom: -3px;
+  width: 7px;
+  z-index: 2;
+  touch-action: none;
+  background: transparent;
+}
+
+.timeline-edge.start {
+  left: -4px;
+  cursor: ew-resize;
+}
+
+.timeline-edge.end {
+  right: -4px;
+  cursor: ew-resize;
+}
+
+.timeline-edge:hover,
+.timeline-edge:active {
+  background: rgb(79 124 255 / 40%);
+}
+
 .correction-dialog-backdrop {
   position: fixed;
   inset: 0;

@@ -10,7 +10,7 @@ import sys
 import threading
 from contextlib import asynccontextmanager
 from pathlib import Path
-from typing import Callable
+from typing import Callable, Literal
 
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.responses import FileResponse, Response
@@ -67,6 +67,12 @@ class EraseIn(BaseModel):
 class CorrectionIn(BaseModel):
     # "__new__" 是 API 协议里的新建说话人；后端会顺延生成 SPEAKER_XX。
     target: str = Field(min_length=1)
+
+
+class BoundaryIn(BaseModel):
+    # start/end 表示拖拽时段的左/右边缘；new_time 是请求的新的交接点。
+    side: Literal["start", "end"]
+    new_time: float = Field(ge=0)
 
 
 def _require_task(manager: TaskManager, task_id: str):
@@ -554,6 +560,33 @@ def create_app(
         except ValueError as e:
             message = str(e)
             status_code = 400 if message == "该时段已属于目标说话人" else 404
+            raise HTTPException(status_code=status_code, detail=message)
+        return _timeline_payload(task)
+
+    @app.put("/api/tasks/{task_id}/segments/{segment_index}/boundary")
+    def move_segment_boundary(task_id: str, segment_index: int, body: BoundaryIn):
+        """人工移动一个时段边界：相邻共享边界联动并立即保存生效快照。"""
+        task = _require_task(manager, task_id)
+        raw = _load_diarization(task)
+        snapshot, state = _correction_snapshot(task, raw)
+        status = _correction_status(
+            task, snapshot, state, manager.workspace_busy(str(task.workspace_dir))
+        )
+        if not status["editable"]:
+            raise HTTPException(status_code=409, detail=status["locked_reason"])
+        try:
+            updated = corrections.apply_boundary_move(
+                raw.get("segments", []),
+                snapshot,
+                segment_index,
+                body.side,
+                body.new_time,
+                _diarization_fingerprint(raw),
+            )
+            corrections.write_corrections(Path(task.workspace_dir), updated)
+        except ValueError as e:
+            message = str(e)
+            status_code = 404 if message == "说话人时段不存在" else 400
             raise HTTPException(status_code=status_code, detail=message)
         return _timeline_payload(task)
 
