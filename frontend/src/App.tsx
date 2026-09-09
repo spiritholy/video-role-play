@@ -18,6 +18,15 @@ const STEM_LABELS: Record<string, string> = {
 interface TimelineSegment {
   start: number;
   end: number;
+  index: number;
+}
+
+interface CorrectionStatus {
+  state: "none" | "active" | "invalidated";
+  revision: number;
+  message: string | null;
+  editable: boolean;
+  locked_reason: string | null;
 }
 
 interface TimelineSpeaker {
@@ -33,6 +42,7 @@ interface Timeline {
   num_speakers: number;
   duration: number;
   speakers: TimelineSpeaker[];
+  correction: CorrectionStatus;
 }
 
 type TimelineOrError = Timeline | "error";
@@ -50,6 +60,12 @@ interface Transcripts {
 }
 
 type TranscriptsOrError = Transcripts | "error";
+
+interface TimelineUpdate {
+  taskId: string;
+  workspaceKey: string;
+  timeline: Timeline;
+}
 
 interface Playing {
   taskId: string;
@@ -188,8 +204,8 @@ export default function App() {
   const [ingestWarnings, setIngestWarnings] = useState<Record<string, string | null>>({});
   const [voiceprintBusy, setVoiceprintBusy] = useState<Record<string, boolean>>({});
   const [playing, setPlaying] = useState<Playing | null>(null);
+  const [correctionError, setCorrectionError] = useState<Record<string, string | null>>({});
   const audioRef = useRef<HTMLAudioElement | null>(null);
-  const requestedTimelines = useRef<Set<string>>(new Set());
   const requestedTranscripts = useRef<Set<string>>(new Set());
   const [videoPath, setVideoPath] = useState("");
   const [probe, setProbe] = useState<ProbeResult | null>(null);
@@ -201,8 +217,6 @@ export default function App() {
   const maybeFetchTimeline = useCallback(
     async (t: Task) => {
       if (!t.stages.some((s) => s.id === "diarize" && s.status === "done")) return;
-      if (requestedTimelines.current.has(t.id)) return;
-      requestedTimelines.current.add(t.id);
       try {
         const resp = await fetch(`/api/tasks/${t.id}/diarization`);
         if (!resp.ok) {
@@ -227,6 +241,79 @@ export default function App() {
       }
     },
     [],
+  );
+
+  const applyTimeline = useCallback((data: TimelineUpdate) => {
+    setTimelines((prev) => ({ ...prev, [data.taskId]: data.timeline }));
+    setSpeakerNames((prev) => ({
+      ...prev,
+      [data.workspaceKey]: Object.fromEntries(
+        data.timeline.speakers
+          .filter((s) => s.name && !s.auto)
+          .map((s) => [s.label, s.name as string]),
+      ),
+    }));
+  }, []);
+
+  const reassignSegment = useCallback(
+    async (task: Task, segment: TimelineSegment, target: string) => {
+      setCorrectionError((prev) => ({ ...prev, [task.id]: null }));
+      try {
+        const resp = await fetch(
+          `/api/tasks/${task.id}/segments/${segment.index}/speaker`,
+          {
+            method: "PUT",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ target }),
+          },
+        );
+        const payload = await resp.json().catch(() => null);
+        if (!resp.ok) {
+          setCorrectionError((prev) => ({
+            ...prev,
+            [task.id]: payload?.detail ?? "改派说话人失败",
+          }));
+          return false;
+        }
+        applyTimeline({
+          taskId: task.id,
+          workspaceKey: workspaceKey(task),
+          timeline: payload,
+        });
+        return true;
+      } catch {
+        setCorrectionError((prev) => ({ ...prev, [task.id]: "无法连接后端服务" }));
+        return false;
+      }
+    },
+    [applyTimeline],
+  );
+
+  const discardCorrections = useCallback(
+    async (task: Task) => {
+      setCorrectionError((prev) => ({ ...prev, [task.id]: null }));
+      try {
+        const resp = await fetch(`/api/tasks/${task.id}/corrections`, {
+          method: "DELETE",
+        });
+        const payload = await resp.json().catch(() => null);
+        if (!resp.ok) {
+          setCorrectionError((prev) => ({
+            ...prev,
+            [task.id]: payload?.detail ?? "放弃校正失败",
+          }));
+          return;
+        }
+        applyTimeline({
+          taskId: task.id,
+          workspaceKey: workspaceKey(task),
+          timeline: payload,
+        });
+      } catch {
+        setCorrectionError((prev) => ({ ...prev, [task.id]: "无法连接后端服务" }));
+      }
+    },
+    [applyTimeline],
   );
 
   const renameSpeaker = useCallback(
@@ -329,7 +416,11 @@ export default function App() {
     };
   }, []);
 
-  function playSegment(taskId: string, speaker: string, seg: TimelineSegment) {
+  function playSegment(
+    taskId: string,
+    speaker: string,
+    seg: Pick<TimelineSegment, "start" | "end">,
+  ) {
     if (!audioRef.current) audioRef.current = new Audio();
     const audio = audioRef.current;
     audio.pause();
@@ -596,6 +687,9 @@ export default function App() {
           onRename={(label, name) => renameSpeaker(t, label, name)}
           onStoreVoiceprint={(label) => handleStoreVoiceprint(t, label)}
           voiceprintBusy={(rowLabel) => Boolean(voiceprintBusy[`${t.id}:${rowLabel}`])}
+          onReassign={(segment, target) => reassignSegment(t, segment, target)}
+          onDiscard={() => discardCorrections(t)}
+          correctionError={correctionError[t.id] ?? null}
         />
         {ingestWarning && <p className="error-text">{ingestWarning}</p>}
         {t.state === "completed" && (
@@ -968,6 +1062,9 @@ function SpeakerTimeline({
   onRename,
   onStoreVoiceprint,
   voiceprintBusy,
+  onReassign,
+  onDiscard,
+  correctionError,
 }: {
   taskId: string;
   timeline: Timeline;
@@ -975,14 +1072,25 @@ function SpeakerTimeline({
   samplesBySpeaker: Record<string, TranscriptSample[]>;
   samplesHint: string | null;
   playing: Playing | null;
-  onPlay: (taskId: string, speaker: string, seg: TimelineSegment) => void;
+  onPlay: (
+    taskId: string,
+    speaker: string,
+    seg: Pick<TimelineSegment, "start" | "end">,
+  ) => void;
   onRename: (label: string, name: string) => Promise<string | null | undefined>;
   onStoreVoiceprint: (label: string) => Promise<void>;
   voiceprintBusy: (label: string) => boolean;
+  onReassign: (segment: TimelineSegment, target: string) => Promise<boolean>;
+  onDiscard: () => Promise<void>;
+  correctionError: string | null;
 }) {
+  const [reassigning, setReassigning] = useState<TimelineSegment | null>(null);
+  const [target, setTarget] = useState("__new__");
+  const [saving, setSaving] = useState(false);
+  const correction = timeline.correction;
   const pct = (v: number) => `${((v / timeline.duration) * 100).toFixed(3)}%`;
   const shown = (sp: TimelineSpeaker) => names[sp.label] ?? sp.name ?? sp.label;
-  const isActive = (sp: TimelineSpeaker, seg: TimelineSegment) =>
+  const isActive = (sp: TimelineSpeaker, seg: Pick<TimelineSegment, "start" | "end">) =>
     playing !== null &&
     playing.taskId === taskId &&
     playing.speaker === sp.label &&
@@ -995,6 +1103,25 @@ function SpeakerTimeline({
         说话人时间轴（共 {timeline.num_speakers} 人，点击名字可命名，点击任意时段试听）
       </div>
       {samplesHint && <p className="timeline-hint">{samplesHint}</p>}
+      {correction.message && <p className="correction-warning">{correction.message}</p>}
+      {correction.locked_reason && correction.state !== "invalidated" && (
+        <p className="correction-warning">{correction.locked_reason}</p>
+      )}
+      {(correction.state === "active" || correction.state === "invalidated") && (
+        <div className="correction-actions">
+          <button
+            type="button"
+            onClick={() => onDiscard()}
+            disabled={
+              saving ||
+              (correction.state !== "invalidated" && !correction.editable)
+            }
+          >
+            {correction.state === "invalidated" ? "放弃作废校正" : "放弃全部校正"}
+          </button>
+        </div>
+      )}
+      {correctionError && <p className="error-text">{correctionError}</p>}
       {timeline.speakers.map((sp) => {
         const color = speakerColor(timeline.speakers, sp.label);
         const samples = samplesBySpeaker[sp.label] ?? [];
@@ -1006,6 +1133,7 @@ function SpeakerTimeline({
                 label={sp.label}
                 name={names[sp.label] ?? sp.name ?? null}
                 auto={Boolean(sp.auto && !names[sp.label])}
+                editable={correction.editable}
                 onRename={onRename}
               />
               <span className="speech-time">{fmtTime(sp.speech_time)}</span>
@@ -1020,20 +1148,37 @@ function SpeakerTimeline({
               </button>
             </span>
             <div className="timeline-track">
-              {sp.segments.map((seg, i) => (
-                <button
-                  key={i}
-                  type="button"
-                  className={`timeline-seg${isActive(sp, seg) ? " playing" : ""}`}
+              {sp.segments.map((seg) => (
+                <div
+                  key={seg.index}
+                  className="timeline-seg-wrap"
                   style={{
                     left: pct(seg.start),
                     width: pct(seg.end - seg.start),
-                    background: color,
                   }}
-                  title={`${shown(sp)} · ${fmtTime(seg.start)} – ${fmtTime(seg.end)}`}
-                  aria-label={`试听 ${shown(sp)}，${fmtTime(seg.start)} 到 ${fmtTime(seg.end)}`}
-                  onClick={() => onPlay(taskId, sp.label, seg)}
-                />
+                >
+                  <button
+                    type="button"
+                    className={`timeline-seg${isActive(sp, seg) ? " playing" : ""}`}
+                    style={{ background: color }}
+                    title={`${shown(sp)} · ${fmtTime(seg.start)} – ${fmtTime(seg.end)}`}
+                    aria-label={`试听 ${shown(sp)}，${fmtTime(seg.start)} 到 ${fmtTime(seg.end)}`}
+                    onClick={() => onPlay(taskId, sp.label, seg)}
+                  />
+                  <button
+                    type="button"
+                    className="timeline-seg-edit"
+                    disabled={!correction.editable}
+                    title={`改派 ${fmtTime(seg.start)} – ${fmtTime(seg.end)} 的说话人`}
+                    aria-label={`改派 ${fmtTime(seg.start)} 到 ${fmtTime(seg.end)} 的说话人时段`}
+                    onClick={() => {
+                      setTarget("__new__");
+                      setReassigning(seg);
+                    }}
+                  >
+                    改
+                  </button>
+                </div>
               ))}
             </div>
             {samples.length > 0 && (
@@ -1073,6 +1218,57 @@ function SpeakerTimeline({
           <span />
         </div>
       )}
+      {reassigning && (
+        <div
+          className="correction-dialog-backdrop"
+          role="presentation"
+          onClick={() => setReassigning(null)}
+        >
+          <div
+            className="correction-dialog"
+            role="dialog"
+            aria-modal="true"
+            onClick={(e) => e.stopPropagation()}
+          >
+            <h3>改派说话人时段</h3>
+            <p className="correction-dialog-meta">
+              {fmtTime(reassigning.start)} – {fmtTime(reassigning.end)}
+            </p>
+            <label>
+              新说话人
+              <select
+                value={target}
+                onChange={(e) => setTarget(e.target.value)}
+              >
+                <option value="__new__">新建说话人（顺延编号）</option>
+                {timeline.speakers.map((sp) => (
+                  <option key={sp.label} value={sp.label}>
+                    {shown(sp)}
+                  </option>
+                ))}
+              </select>
+            </label>
+            <div className="correction-dialog-actions">
+              <button type="button" onClick={() => setReassigning(null)}>
+                取消
+              </button>
+              <button
+                type="button"
+                className="primary"
+                disabled={saving}
+                onClick={async () => {
+                  setSaving(true);
+                  const ok = await onReassign(reassigning, target);
+                  setSaving(false);
+                  if (ok) setReassigning(null);
+                }}
+              >
+                {saving ? "保存中…" : "保存改派"}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   );
 }
@@ -1081,11 +1277,13 @@ function SpeakerName({
   label,
   name,
   auto,
+  editable,
   onRename,
 }: {
   label: string;
   name: string | null;
   auto?: boolean;
+  editable?: boolean;
   onRename: (label: string, name: string) => Promise<string | null | undefined>;
 }) {
   const [editing, setEditing] = useState(false);
@@ -1111,6 +1309,7 @@ function SpeakerName({
         <button
           type="button"
           className="speaker-name"
+          disabled={editable === false}
           title={name ? `改名「${name}」` : `为 ${label} 命名`}
           onClick={() => {
             setDraft(name ?? "");

@@ -652,3 +652,109 @@ button.delete {
 .voiceprint-row button.delete {
   margin-left: auto;
 }
+
+.correction-warning {
+  margin: 0;
+  font-size: 13px;
+  color: #b26a00;
+}
+
+.correction-actions {
+  display: flex;
+  justify-content: flex-end;
+}
+
+.timeline-seg-wrap {
+  position: absolute;
+  top: 3px;
+  bottom: 3px;
+  min-width: 8px;
+}
+
+.timeline-seg-wrap .timeline-seg {
+  position: absolute;
+  left: 0;
+  right: 15px;
+  top: 0;
+  bottom: 0;
+  min-width: 0;
+  border-radius: 3px;
+}
+
+.timeline-seg-wrap .timeline-seg:hover {
+  opacity: 1;
+  filter: brightness(1.12);
+}
+
+.timeline-seg-wrap .timeline-seg.playing {
+  opacity: 1;
+  outline: 2px solid #1f2329;
+  outline-offset: 1px;
+}
+
+.timeline-seg-edit {
+  position: absolute;
+  right: 0;
+  top: 0;
+  bottom: 0;
+  width: 15px;
+  min-width: 15px;
+  padding: 0;
+  border: none;
+  border-left: 1px solid rgba(255, 255, 255, 0.7);
+  border-radius: 0 3px 3px 0;
+  background: rgba(255, 255, 255, 0.82);
+  color: #1f2329;
+  font-size: 9px;
+  line-height: 1;
+}
+
+.timeline-seg-edit:hover:not(:disabled) {
+  background: #fff;
+}
+
+.correction-dialog-backdrop {
+  position: fixed;
+  inset: 0;
+  z-index: 20;
+  display: grid;
+  place-items: center;
+  background: rgba(31, 35, 41, 0.42);
+}
+
+.correction-dialog {
+  width: min(360px, calc(100vw - 32px));
+  padding: 16px;
+  border-radius: 8px;
+  background: #fff;
+}
+
+.correction-dialog h3 {
+  margin: 0 0 6px;
+  font-size: 16px;
+}
+
+.correction-dialog-meta {
+  margin: 0 0 12px;
+  font-size: 13px;
+  color: #86909c;
+}
+
+.correction-dialog label {
+  display: grid;
+  gap: 5px;
+  font-size: 13px;
+}
+
+.correction-dialog select {
+  padding: 5px 7px;
+  border: 1px solid #c9ced6;
+  border-radius: 5px;
+}
+
+.correction-dialog-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+  margin-top: 16px;
+}

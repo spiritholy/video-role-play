@@ -24,7 +24,7 @@ from pathlib import Path
 import threading
 from typing import Iterable
 
-from . import recognition, voiceprints, workspace
+from . import corrections, recognition, voiceprints, workspace
 from .inference import DiarizationResult, Inference, SeparationStems, SpeakerSegment
 from .media import TaskCancelled, TaskError, audio_tracks, ffprobe_json, run_ffmpeg
 from .models import STAGE_DEFS, StageStatus, now_iso
@@ -234,10 +234,13 @@ def _resume_manifest(
 
 
 def _prepare_erase_stages(task, ws: Path, manifest: dict, targets: list[str]) -> None:
-    """擦除前的阶段采纳：目标未变的掩码合成可续用，成品总是重新封装。"""
+    """擦除前的阶段采纳：目标与校正都未变的掩码合成可续用，成品总是重封装。"""
     done = workspace.done_stages(ws, manifest)
-    if (manifest.get("mask_erase") or {}).get("targets") != targets:
-        done.discard("mask_erase")  # 换了目标，已合成的擦除混音不再对应
+    correction = corrections.read_corrections(ws)
+    revision = corrections.correction_revision(correction)
+    stored = manifest.get("mask_erase") or {}
+    if stored.get("targets") != targets or int(stored.get("correction_revision") or 0) != revision:
+        done.discard("mask_erase")  # 换目标或人工校正已变，旧擦除混音不可复用
     done.discard("encode_mux")
     _adopt_chain(task, manifest, ("mask_erase", "encode_mux"), done)
 
@@ -664,13 +667,19 @@ def _wav_duration(wav: Path) -> float:
         return 0.0
 
 
-def _read_diarization_segments(ws: Path) -> list[dict]:
+def _load_diarization_data(ws: Path) -> dict:
+    """读取完整说话人分离产物（含人数/模型元数据，供校正指纹使用）。"""
     path = ws / DIARIZATION_DIR / DIARIZATION_FILENAME
     try:
         data = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError) as e:
         raise TaskError("说话人分离产物缺失或损坏，无法擦除") from e
-    return list(data.get("segments", []))
+    return data if isinstance(data, dict) else {}
+
+
+
+def _read_diarization_segments(ws: Path) -> list[dict]:
+    return list(_load_diarization_data(ws).get("segments", []))
 
 
 def _read_recognition_segments(ws: Path) -> list[dict] | None:
@@ -684,15 +693,26 @@ def _read_recognition_segments(ws: Path) -> list[dict] | None:
     return list(segments) if isinstance(segments, list) else None
 
 
-def _read_corrected_segments(ws: Path) -> list[dict]:
-    """修正后时段：有认人结果用之，否则回退原始说话人分离结果。
+def _read_effective_segments(ws: Path) -> list[dict]:
+    """统一生效时段：人工校正 > 认人/纠错 > 原始说话人分离。
 
-    掩码合成与擦除校验统一读这里（spec #9 擦除语义）。
+    API 时间轴与掩码合成必须读同一个解析器；作废快照不参与掩码。
     """
-    corrected = _read_recognition_segments(ws)
-    if corrected is not None:
-        return corrected
-    return _read_diarization_segments(ws)
+    data = _load_diarization_data(ws)
+    raw = data.get("segments", [])
+    recognition = _read_recognition_segments(ws)
+    snapshot = corrections.read_corrections(ws)
+    return corrections.effective_segments(
+        raw,
+        recognition,
+        snapshot,
+        corrections.diarization_fingerprint(
+            raw,
+            requested_num_speakers=data.get("requested_num_speakers"),
+            num_speakers=data.get("num_speakers"),
+            model=data.get("model"),
+        ),
+    )
 
 
 def _requested_speaker_count(manifest: dict) -> int | None:
@@ -780,7 +800,7 @@ def _stage_mask_erase(
     target_set = set(targets)
     intervals = union_intervals(
         (float(s["start"]), float(s["end"]))
-        for s in _read_corrected_segments(ws)
+        for s in _read_effective_segments(ws)
         if s["speaker"] in target_set
     )
 
@@ -808,7 +828,13 @@ def _stage_mask_erase(
     stage.artifacts.append(rel)
     stage.outputs = {"erased_mix": rel}
     stage.progress = 1.0
-    manifest["mask_erase"] = {"targets": targets, "intervals": intervals}
+    manifest["mask_erase"] = {
+        "targets": targets,
+        "intervals": intervals,
+        "correction_revision": corrections.correction_revision(
+            corrections.read_corrections(ws)
+        ),
+    }
     _end_stage(task, manifest, stage, StageStatus.DONE)
     return mix
 
