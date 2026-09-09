@@ -486,13 +486,24 @@ def run_voiceprint_check(
         int(library.get("revision") or 0),
     )
     on_progress(0.9)
+    data = _load_diarization_data(ws)
+    base_fingerprint = corrections.diarization_fingerprint(
+        data.get("segments", []),
+        requested_num_speakers=data.get("requested_num_speakers"),
+        num_speakers=data.get("num_speakers"),
+        model=data.get("model"),
+    )
     data = {
         "version": 1,
         "status": "pending",
         "model": inference.embedder.name,
         "revision": int(library.get("revision") or 0),
         "used_library": result.used_library,
-        "suggestions": list(result.suggestions),
+        "base_fingerprint": base_fingerprint,
+        "suggestions": [
+            {**suggestion, "decision": "pending"}
+            for suggestion in result.suggestions
+        ],
     }
     out_dir = ws / VOICEPRINT_CHECK_DIR
     out_dir.mkdir(exist_ok=True)
