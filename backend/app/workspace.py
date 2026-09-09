@@ -19,10 +19,9 @@ _UNSAFE = re.compile(r"[^\w.\-]", re.UNICODE)
 
 MANIFEST_VERSION = 1
 
-# 分析阶段（①–④ + 认人/纠错）：产物昂贵且与目标说话人无关，可跨任务
-# 复用。认人/纠错是 spec #9 新增的分析阶段，其产物随声纹库 revision 失效，
-# 只重跑它自己与样本转写（不重跑说话人分离与音源分离）。
-ANALYSIS_STAGES = ("audio_extract", "separate", "diarize", "recognize", "transcribe")
+# 分析阶段（①–④）：产物昂贵且与目标说话人无关，可跨任务复用。
+# 声纹校验是按需建议动作，不属于阶段链，也不会让分析产物失效。
+ANALYSIS_STAGES = ("audio_extract", "separate", "diarize", "transcribe")
 
 
 class WorkspaceNotFound(Exception):
@@ -61,9 +60,8 @@ def read_manifest(ws: Path) -> dict | None:
 def ensure_stage_entries(manifest: dict | None, stage_defs) -> None:
     """确保清单包含全部阶段条目；旧清单缺失的按待运行物化。
 
-    认人/纠错阶段是升级后新增的：升级前的工作区清单里没有它的条目，直接
-    按待运行物化，保证重开不崩（阶段列表统一由任务重建，物化只补条目不
-    写盘，待任务运行时随清单落盘）。
+    旧清单可能含已废弃的认人/纠错条目；这里保留历史条目不重写，新的阶段
+    列表统一由任务重建。物化只补新条目不写盘，待任务运行时随清单落盘。
     """
     if not isinstance(manifest, dict):
         return
@@ -151,8 +149,7 @@ def done_stages(ws: Path, manifest: dict | None) -> set[str]:
 def analysis_reusable(ws: Path, manifest: dict | None) -> bool:
     """全部分析阶段是否齐全（同源新任务可直接复用，几分钟出新成品）。
 
-    含认人/纠错：升级前的工作区缺该阶段条目，须先跑一轮认人/纠错与样本
-    转写才可复用（昂贵的说话人分离与音源分离不重算）。
+    旧认人/纠错产物只是历史证据，不要求其条目齐全；分析链以 ①–④ 为准。
     """
     return set(ANALYSIS_STAGES) <= done_stages(ws, manifest)
 

@@ -54,7 +54,7 @@ def test_完成后工作区存在转写产物且清单更新(client, tmp_path):
     ]
 
     manifest = json.loads((ws / "manifest.json").read_text(encoding="utf-8"))
-    assert [s["status"] for s in manifest["stages"]] == ["done"] * 5 + ["pending"] * 2  # 分析完成；掩码合成/编码封装待擦除触发
+    assert [s["status"] for s in manifest["stages"]] == ["done"] * 4 + ["pending"] * 2  # 分析完成；掩码合成/编码封装待擦除触发
     assert manifest["transcription"] == {
         "model": "canned-whisper",
         "samples": TRANSCRIPTS,
