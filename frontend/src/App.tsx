@@ -1,4 +1,10 @@
-import { useCallback, useEffect, useRef, useState } from "react";
+import {
+  useCallback,
+  useEffect,
+  useRef,
+  useState,
+  type PointerEvent as ReactPointerEvent,
+} from "react";
 
 interface Stage {
   id: string;
@@ -19,6 +25,14 @@ interface TimelineSegment {
   start: number;
   end: number;
   index: number;
+}
+
+type BoundarySide = "start" | "end";
+
+interface BoundaryDrag {
+  segment: TimelineSegment;
+  side: BoundarySide;
+  time: number;
 }
 
 interface CorrectionStatus {
@@ -272,6 +286,40 @@ export default function App() {
           setCorrectionError((prev) => ({
             ...prev,
             [task.id]: payload?.detail ?? "改派说话人失败",
+          }));
+          return false;
+        }
+        applyTimeline({
+          taskId: task.id,
+          workspaceKey: workspaceKey(task),
+          timeline: payload,
+        });
+        return true;
+      } catch {
+        setCorrectionError((prev) => ({ ...prev, [task.id]: "无法连接后端服务" }));
+        return false;
+      }
+    },
+    [applyTimeline],
+  );
+
+  const moveSegmentBoundary = useCallback(
+    async (task: Task, segment: TimelineSegment, side: BoundarySide, time: number) => {
+      setCorrectionError((prev) => ({ ...prev, [task.id]: null }));
+      try {
+        const resp = await fetch(
+          `/api/tasks/${task.id}/segments/${segment.index}/boundary`,
+          {
+            method: "PUT",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ side, new_time: time }),
+          },
+        );
+        const payload = await resp.json().catch(() => null);
+        if (!resp.ok) {
+          setCorrectionError((prev) => ({
+            ...prev,
+            [task.id]: payload?.detail ?? "调整时段边界失败",
           }));
           return false;
         }
@@ -688,6 +736,7 @@ export default function App() {
           onStoreVoiceprint={(label) => handleStoreVoiceprint(t, label)}
           voiceprintBusy={(rowLabel) => Boolean(voiceprintBusy[`${t.id}:${rowLabel}`])}
           onReassign={(segment, target) => reassignSegment(t, segment, target)}
+          onBoundary={(segment, side, time) => moveSegmentBoundary(t, segment, side, time)}
           onDiscard={() => discardCorrections(t)}
           correctionError={correctionError[t.id] ?? null}
         />
@@ -1063,6 +1112,7 @@ function SpeakerTimeline({
   onStoreVoiceprint,
   voiceprintBusy,
   onReassign,
+  onBoundary,
   onDiscard,
   correctionError,
 }: {
@@ -1081,12 +1131,18 @@ function SpeakerTimeline({
   onStoreVoiceprint: (label: string) => Promise<void>;
   voiceprintBusy: (label: string) => boolean;
   onReassign: (segment: TimelineSegment, target: string) => Promise<boolean>;
+  onBoundary: (
+    segment: TimelineSegment,
+    side: BoundarySide,
+    time: number,
+  ) => Promise<boolean>;
   onDiscard: () => Promise<void>;
   correctionError: string | null;
 }) {
   const [reassigning, setReassigning] = useState<TimelineSegment | null>(null);
   const [target, setTarget] = useState("__new__");
   const [saving, setSaving] = useState(false);
+  const [dragging, setDragging] = useState<BoundaryDrag | null>(null);
   const correction = timeline.correction;
   const pct = (v: number) => `${((v / timeline.duration) * 100).toFixed(3)}%`;
   const shown = (sp: TimelineSpeaker) => names[sp.label] ?? sp.name ?? sp.label;
@@ -1097,10 +1153,101 @@ function SpeakerTimeline({
     playing.start === seg.start &&
     playing.end === seg.end;
 
+  const allSegments = timeline.speakers.flatMap((sp) => sp.segments);
+  const shownTimeline = (() => {
+    if (dragging === null || !correction.editable) return timeline;
+    const { segment, side, time } = dragging;
+    const sharedNeighbor = allSegments.find(
+      (other) =>
+        other.index !== segment.index &&
+        Math.abs(
+          (side === "end" ? other.start : other.end) -
+            (side === "end" ? segment.end : segment.start),
+        ) < 0.0005,
+    );
+    let min = side === "end" ? segment.start + 0.001 : 0;
+    let max = side === "end" ? timeline.duration : segment.end - 0.001;
+    if (sharedNeighbor) {
+      if (side === "end") {
+        max = Math.min(max, sharedNeighbor.end - 0.001);
+      } else {
+        min = Math.max(min, sharedNeighbor.start + 0.001);
+      }
+    } else {
+      const neighbor = allSegments.find(
+        (other) =>
+          other.index !== segment.index &&
+          (side === "end" ? other.start >= segment.end : other.end <= segment.start),
+      );
+      if (neighbor) {
+        if (side === "end") max = Math.min(max, neighbor.start);
+        else min = Math.max(min, neighbor.end);
+      }
+    }
+    const boundary = Math.min(max, Math.max(min, time));
+    const updates = new Map<number, TimelineSegment>([
+      [
+        segment.index,
+        side === "end" ? { ...segment, end: boundary } : { ...segment, start: boundary },
+      ],
+    ]);
+    if (sharedNeighbor) {
+      updates.set(
+        sharedNeighbor.index,
+        side === "end"
+          ? { ...sharedNeighbor, start: boundary }
+          : { ...sharedNeighbor, end: boundary },
+      );
+    }
+    return {
+      ...timeline,
+      speakers: timeline.speakers.map((sp) => ({
+        ...sp,
+        segments: sp.segments.map((seg) => updates.get(seg.index) ?? seg),
+      })),
+    };
+  })();
+
+  function startBoundaryDrag(
+    event: ReactPointerEvent<HTMLDivElement>,
+    segment: TimelineSegment,
+    side: BoundarySide,
+  ) {
+    if (!correction.editable || timeline.duration <= 0) return;
+    event.preventDefault();
+    event.stopPropagation();
+    event.currentTarget.setPointerCapture(event.pointerId);
+    setDragging({
+      segment,
+      side,
+      time: side === "end" ? segment.end : segment.start,
+    });
+  }
+
+  function moveBoundaryDrag(event: ReactPointerEvent<HTMLDivElement>) {
+    if (dragging === null) return;
+    const track = event.currentTarget.closest<HTMLElement>(".timeline-track");
+    if (!track || timeline.duration <= 0) return;
+    const rect = track.getBoundingClientRect();
+    if (rect.width <= 0) return;
+    const time = ((event.clientX - rect.left) / rect.width) * timeline.duration;
+    setDragging((prev) =>
+      prev ? { ...prev, time: Math.min(timeline.duration, Math.max(0, time)) } : prev,
+    );
+  }
+
+  function finishBoundaryDrag(commit: boolean) {
+    const request = dragging;
+    setDragging(null);
+    if (commit && request && correction.editable) {
+      void onBoundary(request.segment, request.side, request.time);
+    }
+  }
+
   return (
     <div className="timeline">
       <div className="timeline-title">
-        说话人时间轴（共 {timeline.num_speakers} 人，点击名字可命名，点击任意时段试听）
+        说话人时间轴（共 {timeline.num_speakers} 人，点击名字可命名，点击任意时段试听，拖拽边缘可调整边界）
       </div>
       {samplesHint && <p className="timeline-hint">{samplesHint}</p>}
       {correction.message && <p className="correction-warning">{correction.message}</p>}
@@ -1122,7 +1269,7 @@ function SpeakerTimeline({
         </div>
       )}
       {correctionError && <p className="error-text">{correctionError}</p>}
-      {timeline.speakers.map((sp) => {
+      {shownTimeline.speakers.map((sp) => {
         const color = speakerColor(timeline.speakers, sp.label);
         const samples = samplesBySpeaker[sp.label] ?? [];
         return (
@@ -1157,6 +1304,23 @@ function SpeakerTimeline({
                     width: pct(seg.end - seg.start),
                   }}
                 >
+                  {correction.editable &&
+                    !allSegments.some(
+                      (other) =>
+                        other.index !== seg.index &&
+                        Math.abs(other.end - seg.start) < 0.0005,
+                    ) && (
+                      <div
+                        className="timeline-edge start"
+                        title={`拖拽 ${shown(sp)} 的开始边界`}
+                        role="separator"
+                        aria-orientation="vertical"
+                        onPointerDown={(event) => startBoundaryDrag(event, seg, "start")}
+                        onPointerMove={moveBoundaryDrag}
+                        onPointerUp={() => finishBoundaryDrag(true)}
+                        onPointerCancel={() => finishBoundaryDrag(false)}
+                      />
+                    )}
                   <button
                     type="button"
                     className={`timeline-seg${isActive(sp, seg) ? " playing" : ""}`}
@@ -1165,6 +1329,23 @@ function SpeakerTimeline({
                     aria-label={`试听 ${shown(sp)}，${fmtTime(seg.start)} 到 ${fmtTime(seg.end)}`}
                     onClick={() => onPlay(taskId, sp.label, seg)}
                   />
+                  {correction.editable &&
+                    !allSegments.some(
+                      (other) =>
+                        other.index !== seg.index &&
+                        Math.abs(other.start - seg.end) < 0.0005,
+                    ) && (
+                      <div
+                        className="timeline-edge end"
+                        title={`拖拽 ${shown(sp)} 的结束边界`}
+                        role="separator"
+                        aria-orientation="vertical"
+                        onPointerDown={(event) => startBoundaryDrag(event, seg, "end")}
+                        onPointerMove={moveBoundaryDrag}
+                        onPointerUp={() => finishBoundaryDrag(true)}
+                        onPointerCancel={() => finishBoundaryDrag(false)}
+                      />
+                    )}
                   <button
                     type="button"
                     className="timeline-seg-edit"

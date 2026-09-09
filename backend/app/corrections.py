@@ -18,6 +18,9 @@ from pathlib import Path
 _CORRECTIONS = "corrections.json"
 CORRECTIONS_VERSION = 1
 _LABEL_NUMBER = re.compile(r"SPEAKER_(\d+)\Z")
+# 时段最小宽度：拖拽不允许把一个时段夹成零时长，也避免浮点数产生退化区间。
+MIN_SEGMENT_SECONDS = 1e-6
+
 
 
 def diarization_fingerprint(
@@ -66,6 +69,10 @@ def _valid_segments(value) -> list[dict] | None:
         if not isinstance(speaker, str) or not speaker or not math.isfinite(start) or not math.isfinite(end) or start >= end:
             return None
         result.append({"speaker": speaker, "start": start, "end": end})
+    # 快照是一份完整生效时段表；任何重叠都违反互斥归属，按无效快照回退。
+    ordered = sorted(result, key=lambda item: (item["start"], item["end"]))
+    if any(a["end"] > b["start"] for a, b in zip(ordered, ordered[1:])):
+        return None
     return result
 
 
@@ -124,6 +131,20 @@ def next_speaker_label(segments: list[dict], created_labels=()) -> str:
     return f"SPEAKER_{max(numbers, default=-1) + 1:02d}"
 
 
+def _effective_snapshot_segments(
+    base_segments: list[dict],
+    snapshot: dict | None,
+    base_fingerprint: str | None,
+) -> list[dict]:
+    """编辑前使用的完整时段：有效校正快照优先，否则回到原始分离。"""
+    if snapshot_state(base_segments, snapshot, base_fingerprint) != "active":
+        snapshot = None
+    return _valid_segments((snapshot or {}).get("segments")) or [
+        {"speaker": str(s["speaker"]), "start": float(s["start"]), "end": float(s["end"])}
+        for s in base_segments
+    ]
+
+
 def apply_reassignment(
     base_segments: list[dict],
     snapshot: dict | None,
@@ -136,12 +157,7 @@ def apply_reassignment(
     segment_index 是生效时段在原始分离顺序中的索引；快照保持该顺序，因
     此改派可以跨任务稳定定位。函数是纯函数，调用方负责持久化。
     """
-    if snapshot_state(base_segments, snapshot, base_fingerprint) != "active":
-        snapshot = None
-    current = _valid_segments((snapshot or {}).get("segments")) or [
-        {"speaker": str(s["speaker"]), "start": float(s["start"]), "end": float(s["end"])}
-        for s in base_segments
-    ]
+    current = _effective_snapshot_segments(base_segments, snapshot, base_fingerprint)
     if not isinstance(segment_index, int) or not 0 <= segment_index < len(current):
         raise ValueError("说话人时段不存在")
     created_labels = list((snapshot or {}).get("created_labels") or [])
@@ -161,6 +177,101 @@ def apply_reassignment(
         "segments": segments,
         "created_labels": created_labels,
         "revision": revision,
+        "updated_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+    }
+
+
+def apply_boundary_move(
+    base_segments: list[dict],
+    snapshot: dict | None,
+    segment_index: int,
+    side: str,
+    new_time: float,
+    base_fingerprint: str | None = None,
+) -> dict:
+    """移动一个时段边界；相邻共享边界双向联动，空隙内自由延伸并钳制。
+
+    撞到时间相邻段时边界停在对方边界（共享时一起移动），因此任何返回
+    值都不会制造重叠；调用方负责把返回的完整快照持久化。
+    """
+    if snapshot_state(base_segments, snapshot, base_fingerprint) != "active":
+        snapshot = None  # 无效快照不继承修订号或历史新建说话人
+    current = _effective_snapshot_segments(base_segments, snapshot, base_fingerprint)
+    if not isinstance(segment_index, int) or not 0 <= segment_index < len(current):
+        raise ValueError("说话人时段不存在")
+    if side not in {"start", "end"}:
+        raise ValueError("边界方向非法")
+    try:
+        requested = float(new_time)
+    except (TypeError, ValueError) as e:
+        raise ValueError("边界时间非法") from e
+    if not math.isfinite(requested):
+        raise ValueError("边界时间非法")
+
+    target = dict(current[segment_index])
+    if side == "end" and requested <= target["start"]:
+        raise ValueError("边界修改会使说话人时段零时长")
+    if side == "start" and requested >= target["end"]:
+        raise ValueError("边界修改会使说话人时段零时长")
+    ordered = sorted(enumerate(current), key=lambda pair: (pair[1]["start"], pair[1]["end"]))
+    position = next(
+        i for i, (original_index, _) in enumerate(ordered)
+        if original_index == segment_index
+    )
+
+    if side == "end":
+        later = ordered[position + 1:]
+        if later:
+            _, neighbor = later[0]
+            # 共享边界（start == end）联动；有空洞时最多认领到 neighbor.start。
+            if abs(neighbor["start"] - target["end"]) <= MIN_SEGMENT_SECONDS:
+                lower = target["start"] + MIN_SEGMENT_SECONDS
+                upper = neighbor["end"] - MIN_SEGMENT_SECONDS
+            else:
+                lower = target["start"] + MIN_SEGMENT_SECONDS
+                upper = neighbor["start"]
+        else:
+            lower = target["start"] + MIN_SEGMENT_SECONDS
+            upper = math.inf
+        if lower > upper:
+            raise ValueError("边界修改会使说话人时段零时长")
+        requested = min(max(requested, lower), upper)
+        target["end"] = requested
+        # 只有原本共享边界时才联动；钳制到空洞里的邻居起点不改变对方。
+        for i, item in ordered[position + 1:]:
+            if abs(item["start"] - current[segment_index]["end"]) <= MIN_SEGMENT_SECONDS:
+                current[i] = {**item, "start": requested}
+    else:
+        earlier = list(reversed(ordered[:position]))
+        if earlier:
+            _, neighbor = earlier[0]
+            if abs(neighbor["end"] - target["start"]) <= MIN_SEGMENT_SECONDS:
+                lower = neighbor["start"] + MIN_SEGMENT_SECONDS
+                upper = target["end"] - MIN_SEGMENT_SECONDS
+            else:
+                lower = neighbor["end"]
+                upper = target["end"] - MIN_SEGMENT_SECONDS
+        else:
+            lower = 0.0
+            upper = target["end"] - MIN_SEGMENT_SECONDS
+        if lower > upper:
+            raise ValueError("边界修改会使说话人时段零时长")
+        requested = min(max(requested, lower), upper)
+        target["start"] = requested
+        for i, item in reversed(ordered[:position]):
+            if abs(item["end"] - current[segment_index]["start"]) <= MIN_SEGMENT_SECONDS:
+                current[i] = {**item, "end": requested}
+    current[segment_index] = target
+
+    ordered = sorted(current, key=lambda item: (item["start"], item["end"]))
+    if any(a["end"] > b["start"] for a, b in zip(ordered, ordered[1:])):
+        raise ValueError("边界修改会破坏互斥归属")
+    return {
+        "version": CORRECTIONS_VERSION,
+        "base_fingerprint": base_fingerprint or diarization_fingerprint(base_segments),
+        "segments": current,
+        "created_labels": list((snapshot or {}).get("created_labels") or []),
+        "revision": int((snapshot or {}).get("revision") or 0) + 1,
         "updated_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
     }
 
