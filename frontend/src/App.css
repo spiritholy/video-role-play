@@ -325,6 +325,19 @@ button.resume {
   font-size: 12px;
 }
 
+button.store-voiceprint {
+  margin-left: 6px;
+  font-size: 12px;
+  color: #4b5ffe;
+  border-color: #c1d0ff;
+  white-space: nowrap;
+}
+
+button.store-voiceprint:disabled {
+  color: #86909c;
+  border-color: #e5e6eb;
+}
+
 .speaker-name {
   max-width: 140px;
   overflow: hidden;
