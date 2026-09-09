@@ -815,7 +815,7 @@ button.delete {
 
 .suggestion {
   display: grid;
-  grid-template-columns: auto 1fr auto;
+  grid-template-columns: auto 1fr auto auto;
   gap: 8px;
   align-items: center;
   font-size: 12px;
@@ -830,4 +830,22 @@ button.delete {
 
 .suggestion-state {
   color: #e8a13a;
+}
+
+.suggestion-state.accepted {
+  color: #2ba24c;
+}
+
+.suggestion-state.ignored {
+  color: #7a8699;
+}
+
+.suggestion-actions {
+  display: flex;
+  gap: 6px;
+}
+
+.suggestion-actions button {
+  font-size: 11px;
+  padding: 3px 8px;
 }

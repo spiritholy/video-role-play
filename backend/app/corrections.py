@@ -181,6 +181,121 @@ def apply_reassignment(
     }
 
 
+def _suggestion_snapshot_payload(
+    base_segments: list[dict],
+    snapshot: dict | None,
+    base_fingerprint: str | None,
+    segments: list[dict],
+    renames: dict[str, str],
+) -> dict:
+    """三个建议并入函数共享的完整校正快照结构。"""
+    return {
+        "version": CORRECTIONS_VERSION,
+        "base_fingerprint": base_fingerprint or diarization_fingerprint(base_segments),
+        "segments": segments,
+        "created_labels": list((snapshot or {}).get("created_labels") or []),
+        "renames": renames,
+        "revision": int((snapshot or {}).get("revision") or 0) + 1,
+        "updated_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+    }
+
+
+def apply_voiceprint_rename(
+    base_segments: list[dict],
+    snapshot: dict | None,
+    label: str,
+    name: str,
+    base_fingerprint: str | None = None,
+) -> dict:
+    """接受命名建议：把建议命名记入校正层，不改任何生效时段。"""
+    if snapshot_state(base_segments, snapshot, base_fingerprint) != "active":
+        snapshot = None
+    current = _effective_snapshot_segments(base_segments, snapshot, base_fingerprint)
+    clean = str(name or "").strip()
+    if not clean:
+        raise ValueError("说话人名字不能为空")
+    if str(label) not in {s["speaker"] for s in current}:
+        raise ValueError("说话人不存在")
+    renames = dict((snapshot or {}).get("renames") or {})
+    renames[str(label)] = clean
+    return _suggestion_snapshot_payload(
+        base_segments, snapshot, base_fingerprint, current, renames
+    )
+
+
+def apply_voiceprint_merge(
+    base_segments: list[dict],
+    snapshot: dict | None,
+    suggestion: dict,
+    base_fingerprint: str | None = None,
+) -> dict:
+    """接受合并建议：把同名非规范簇整体改派到规范标签。"""
+    if snapshot_state(base_segments, snapshot, base_fingerprint) != "active":
+        snapshot = None
+    current = _effective_snapshot_segments(base_segments, snapshot, base_fingerprint)
+    labels = suggestion.get("labels")
+    canonical = suggestion.get("canonical")
+    valid_labels = isinstance(labels, list) and len(labels) >= 2
+    valid_canonical = isinstance(canonical, str) and bool(canonical)
+    if not valid_labels or not valid_canonical:
+        raise ValueError("合并建议非法")
+    labels = [str(label) for label in labels]
+    known = {s["speaker"] for s in current}
+    if canonical not in known or any(label not in known for label in labels):
+        raise ValueError("合并建议包含不存在的说话人")
+    segments = [dict(s) for s in current]
+    changed = False
+    for segment in segments:
+        if segment["speaker"] in labels and segment["speaker"] != canonical:
+            segment["speaker"] = canonical
+            changed = True
+    if not changed:
+        raise ValueError("该合并建议已生效")
+    renames = dict((snapshot or {}).get("renames") or {})
+    return _suggestion_snapshot_payload(
+        base_segments, snapshot, base_fingerprint, segments, renames
+    )
+
+
+def apply_voiceprint_reassign(
+    base_segments: list[dict],
+    snapshot: dict | None,
+    suggestion: dict,
+    base_fingerprint: str | None = None,
+) -> dict:
+    """接受改派建议：按原始时段定位单段并改派到建议目标。"""
+    if snapshot_state(base_segments, snapshot, base_fingerprint) != "active":
+        snapshot = None
+    current = _effective_snapshot_segments(base_segments, snapshot, base_fingerprint)
+    from_label = suggestion.get("from_label")
+    target = str(suggestion.get("to_label") or suggestion.get("name") or "").strip()
+    if not isinstance(from_label, str) or not target:
+        raise ValueError("改派建议非法")
+    try:
+        start = float(suggestion.get("start"))
+        end = float(suggestion.get("end"))
+    except (TypeError, ValueError) as e:
+        raise ValueError("改派建议非法") from e
+    matches = [
+        i for i, s in enumerate(current)
+        if s["speaker"] == from_label
+        and math.isclose(s["start"], start, abs_tol=MIN_SEGMENT_SECONDS)
+        and math.isclose(s["end"], end, abs_tol=MIN_SEGMENT_SECONDS)
+    ]
+    if not matches:
+        raise ValueError("说话人时段不存在")
+    if len(matches) > 1:
+        raise ValueError("改派建议定位到多个时段")
+    if current[matches[0]]["speaker"] == target:
+        raise ValueError("该时段已属于目标说话人")
+    segments = [dict(s) for s in current]
+    segments[matches[0]]["speaker"] = target
+    renames = dict((snapshot or {}).get("renames") or {})
+    return _suggestion_snapshot_payload(
+        base_segments, snapshot, base_fingerprint, segments, renames
+    )
+
+
 def apply_boundary_move(
     base_segments: list[dict],
     snapshot: dict | None,

@@ -122,6 +122,7 @@ interface Task {
 
 interface VoiceprintSuggestion {
   type: "rename" | "merge" | "reassign";
+  decision?: "pending" | "accepted" | "ignored";
   label?: string;
   name?: string;
   similarity?: number;
@@ -134,6 +135,7 @@ interface VoiceprintSuggestion {
 }
 
 interface VoiceprintCheckResult {
+  status?: "pending" | "invalidated";
   suggestions: VoiceprintSuggestion[];
 }
 
@@ -244,6 +246,7 @@ export default function App() {
   const [voiceprintBusy, setVoiceprintBusy] = useState<Record<string, boolean>>({});
   const [checkStates, setCheckStates] = useState<Record<string, VoiceprintCheckState>>({});
   const [checkError, setCheckError] = useState<string | null>(null);
+  const [decisionBusy, setDecisionBusy] = useState<Record<string, boolean>>({});
   const [playing, setPlaying] = useState<Playing | null>(null);
   const [correctionError, setCorrectionError] = useState<Record<string, string | null>>({});
   const audioRef = useRef<HTMLAudioElement | null>(null);
@@ -830,6 +833,43 @@ export default function App() {
     }
   }
 
+  async function decideSuggestion(t: Task, index: number, decision: "accept" | "ignore") {
+    const key = `${t.id}:${index}`;
+    if (decisionBusy[key]) return;
+    setDecisionBusy((prev) => ({ ...prev, [key]: true }));
+    setCheckError(null);
+    try {
+      const resp = await fetch(
+        `/api/tasks/${t.id}/voiceprint-check/suggestions/${index}/decision`,
+        {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ decision }),
+        },
+      );
+      const data = await resp.json().catch(() => null);
+      if (!resp.ok) {
+        setCheckError(data?.detail ?? "建议裁决失败");
+        return;
+      }
+      setCheckStates((prev) => ({
+        ...prev,
+        [t.id]: {
+          ...(prev[t.id] ?? { state: "completed", progress: 1, error: null }),
+          state: "completed",
+          progress: 1,
+          error: null,
+          result: data.result,
+        },
+      }));
+      applyTimeline({ taskId: t.id, workspaceKey: workspaceKey(t), timeline: data.timeline });
+    } catch {
+      setCheckError("无法连接后端服务");
+    } finally {
+      setDecisionBusy((prev) => ({ ...prev, [key]: false }));
+    }
+  }
+
   function suggestionText(s: VoiceprintSuggestion): string {
     const pct = (v?: number) => (v == null ? "" : ` · 相似度 ${Math.round(v * 100)}%`);
     if (s.type === "rename") return `建议把 ${s.label} 命名为「${s.name}」${pct(s.similarity)}`;
@@ -864,6 +904,9 @@ export default function App() {
         {check.state === "failed" && <p className="error-text">{check.error ?? "声纹校验失败"}</p>}
         {check.state === "cancelled" && <p className="timeline-hint">声纹校验已取消。</p>}
         {check.state === "not_run" && <p className="timeline-hint">尚未校验。此操作只生成建议，不会直接修改时段。</p>}
+        {check.result?.status === "invalidated" && (
+          <p className="correction-warning">声纹校验建议已作废：说话人分离已重新进行。</p>
+        )}
         {check.result?.suggestions?.length ? (
           <ul className="suggestion-list">
             {check.result.suggestions.map((s, i) => (
@@ -872,7 +915,29 @@ export default function App() {
                   {s.type === "rename" ? "命名" : s.type === "merge" ? "合并" : "改派"}
                 </span>
                 <span>{suggestionText(s)}</span>
-                <span className="suggestion-state">待确认</span>
+                <span className={`suggestion-state ${s.decision ?? "pending"}`}>
+                  {s.decision === "accepted" ? "已接受" : s.decision === "ignored" ? "已忽略" : "待确认"}
+                </span>
+                {check.result?.status === "invalidated" ? null : (
+                  <span className="suggestion-actions">
+                    <button
+                      type="button"
+                      className="resume"
+                      disabled={Boolean(decisionBusy[`${t.id}:${i}`])}
+                      onClick={() => decideSuggestion(t, i, "accept")}
+                    >
+                      接受
+                    </button>
+                    <button
+                      type="button"
+                      className="cancel"
+                      disabled={Boolean(decisionBusy[`${t.id}:${i}`])}
+                      onClick={() => decideSuggestion(t, i, "ignore")}
+                    >
+                      忽略
+                    </button>
+                  </span>
+                )}
               </li>
             ))}
           </ul>

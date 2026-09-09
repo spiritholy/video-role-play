@@ -9,6 +9,9 @@ from app.corrections import (
     effective_segments,
     next_speaker_label,
     snapshot_state,
+    apply_voiceprint_merge,
+    apply_voiceprint_reassign,
+    apply_voiceprint_rename,
 )
 
 BASE = [
@@ -120,3 +123,41 @@ def test_边界修改拒绝不存在时段并保持互斥():
     snapshot = apply_boundary_move(BASE, None, 0, "end", 1.05)
     ordered = sorted(snapshot["segments"], key=lambda s: s["start"])
     assert all(a["end"] <= b["start"] for a, b in zip(ordered, ordered[1:]))
+
+
+def test_声纹改派建议按时段并入并允许命名目标():
+    snapshot = apply_voiceprint_reassign(
+        BASE,
+        None,
+        {
+            "type": "reassign",
+            "from_label": "SPEAKER_00",
+            "to_label": "Ross",
+            "start": 0.2,
+            "end": 0.9,
+        },
+    )
+    assert snapshot["segments"][0] == {"speaker": "Ross", "start": 0.2, "end": 0.9}
+    assert snapshot["segments"][1:] == BASE[1:]
+    assert snapshot["revision"] == 1
+
+
+def test_声纹合并建议把非规范簇并入规范标签():
+    suggestion = {
+        "type": "merge",
+        "labels": ["SPEAKER_00", "SPEAKER_01"],
+        "canonical": "SPEAKER_01",
+    }
+    snapshot = apply_voiceprint_merge(BASE, None, suggestion)
+    assert all(s["speaker"] == "SPEAKER_01" for s in snapshot["segments"])
+    assert [s["start"] for s in snapshot["segments"]] == [0.2, 0.95, 1.3]
+
+
+def test_接受命名建议写入校正快照且不改时段():
+    snapshot = apply_voiceprint_rename(BASE, None, "SPEAKER_00", "Ross")
+    assert snapshot["segments"] == BASE
+    assert snapshot["renames"] == {"SPEAKER_00": "Ross"}
+    assert snapshot["revision"] == 1
+    assert apply_voiceprint_rename(BASE, snapshot, "SPEAKER_01", "Rachel")[
+        "renames"
+    ] == {"SPEAKER_00": "Ross", "SPEAKER_01": "Rachel"}

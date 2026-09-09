@@ -77,6 +77,12 @@ class BoundaryIn(BaseModel):
     new_time: float = Field(ge=0)
 
 
+
+class SuggestionDecisionIn(BaseModel):
+    # ignore 只是裁决标记，不删除建议；accept 才会并入人工校正层。
+    decision: Literal["accept", "ignore"]
+
+
 def _require_task(manager: TaskManager, task_id: str):
     task = manager.get(task_id)
     if task is None or task.workspace_dir is None:
@@ -101,10 +107,41 @@ def _read_voiceprint_check(ws: Path) -> dict | None:
     """按需声纹校验建议；缺失/损坏返回 None（不当作已校验）。"""
     path = ws / VOICEPRINT_CHECK_DIR / VOICEPRINT_CHECK_FILENAME
     try:
-        return json.loads(path.read_text(encoding="utf-8"))
+        data = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError):
         return None
+    return data if isinstance(data, dict) else None
 
+
+def _save_voiceprint_check(ws: Path, data: dict) -> None:
+    """建议裁决随工作区原子持久化。"""
+    path = ws / VOICEPRINT_CHECK_DIR / VOICEPRINT_CHECK_FILENAME
+    path.parent.mkdir(exist_ok=True)
+    tmp = path.with_suffix(".json.tmp")
+    tmp.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+    tmp.replace(path)
+
+
+def _check_with_state(data: dict | None, raw: dict) -> dict | None:
+    """校验建议跟随当前说话人分离作废；裁决结果仍保留展示。"""
+    if not isinstance(data, dict):
+        return None
+    stored = data.get("base_fingerprint")
+    if stored and stored != _diarization_fingerprint(raw):
+        return {**data, "status": "invalidated"}
+    return data
+
+
+def _effective_speaker_names(
+    ws: Path, snapshot: dict | None, state: str
+) -> dict[str, str]:
+    """生效命名：手工命名优先，接受的声纹命名随有效校正层显示。"""
+    accepted = (
+        snapshot.get("renames")
+        if state == "active" and isinstance((snapshot or {}).get("renames"), dict)
+        else {}
+    )
+    return {**accepted, **workspace.read_speaker_names(ws)}
 
 
 def _diarization_fingerprint(raw: dict) -> str:
@@ -505,7 +542,7 @@ def create_app(
             sp["segments"].append(
                 {"start": turn["start"], "end": turn["end"], "index": turn["index"]}
             )
-        names = workspace.read_speaker_names(Path(task.workspace_dir))
+        names = _effective_speaker_names(Path(task.workspace_dir), snapshot, state)
         rows = []
         for k in sorted(speakers):
             manual = names.get(k)
@@ -631,21 +668,96 @@ def create_app(
         task = manager.get(task_id)
         if task is not None and task.voiceprint_check is not None:
             state = dict(task.voiceprint_check)
+            result = state.get("result")
+            if result:
+                result = _check_with_state(result, _load_diarization(task))
             return {
                 "state": state.get("state"),
                 "progress": state.get("progress", 0.0),
                 "error": state.get("error"),
-                "result": state.get("result"),
+                "result": result,
             }
         if task is None:
             raise HTTPException(status_code=404, detail="任务不存在")
         persisted = _read_voiceprint_check(Path(task.workspace_dir))
+        if persisted:
+            persisted = _check_with_state(persisted, _load_diarization(task))
         return {
             "state": "completed" if persisted else "not_run",
             "progress": 1.0 if persisted else 0.0,
             "error": None,
             "result": persisted,
         }
+
+    @app.post("/api/tasks/{task_id}/voiceprint-check/suggestions/{suggestion_index}/decision")
+    def decide_voiceprint_suggestion(task_id: str, suggestion_index: int, body: SuggestionDecisionIn):
+        """逐条裁决声纹建议：接受并入校正层，忽略只标记不删除。"""
+        task = _require_task(manager, task_id)
+        ws = Path(task.workspace_dir)
+        if manager.workspace_busy(str(ws)):
+            raise HTTPException(
+                status_code=409,
+                detail="工作区有排队中或运行中的处理任务，建议已锁定",
+            )
+        if task.voiceprint_check and task.voiceprint_check.get("state") in (
+            "queued", "running"
+        ):
+            raise HTTPException(status_code=409, detail="声纹校验正在运行，请先取消")
+        raw = _load_diarization(task)
+        persisted = _check_with_state(_read_voiceprint_check(ws), raw)
+        if persisted is None:
+            raise HTTPException(status_code=404, detail="声纹校验建议不存在")
+        if persisted.get("status") == "invalidated":
+            raise HTTPException(
+                status_code=409,
+                detail="声纹校验建议已作废：说话人分离已重新进行",
+            )
+        suggestions = persisted.get("suggestions")
+        if not isinstance(suggestions, list) or not 0 <= suggestion_index < len(suggestions):
+            raise HTTPException(status_code=404, detail="声纹校验建议不存在")
+        suggestion = dict(suggestions[suggestion_index])
+        if body.decision == "ignore":
+            suggestion["decision"] = "ignored"
+        elif suggestion.get("decision") != "accepted":
+            suggestion["decision"] = "accepted"
+            snapshot, state = _correction_snapshot(task, raw)
+            status = _correction_status(task, snapshot, state, False)
+            if not status["editable"]:
+                raise HTTPException(status_code=409, detail=status["locked_reason"])
+            try:
+                if suggestion.get("type") == "rename":
+                    updated = corrections.apply_voiceprint_rename(
+                        raw.get("segments", []),
+                        snapshot,
+                        str(suggestion.get("label") or ""),
+                        str(suggestion.get("name") or ""),
+                        _diarization_fingerprint(raw),
+                    )
+                elif suggestion.get("type") == "merge":
+                    updated = corrections.apply_voiceprint_merge(
+                        raw.get("segments", []),
+                        snapshot,
+                        suggestion,
+                        _diarization_fingerprint(raw),
+                    )
+                elif suggestion.get("type") == "reassign":
+                    updated = corrections.apply_voiceprint_reassign(
+                        raw.get("segments", []),
+                        snapshot,
+                        suggestion,
+                        _diarization_fingerprint(raw),
+                    )
+                else:
+                    raise ValueError("建议类型非法")
+            except ValueError as e:
+                raise HTTPException(status_code=400, detail=str(e)) from e
+            corrections.write_corrections(ws, updated)
+        suggestions[suggestion_index] = suggestion
+        persisted["suggestions"] = suggestions
+        _save_voiceprint_check(ws, persisted)
+        if task.voiceprint_check is not None:
+            task.voiceprint_check["result"] = persisted
+        return {"result": persisted, "timeline": _timeline_payload(task)}
 
     @app.delete("/api/tasks/{task_id}/voiceprint-check")
     def cancel_voiceprint_check(task_id: str):
@@ -702,7 +814,8 @@ def create_app(
         if label not in known:
             raise HTTPException(status_code=404, detail="说话人不存在")
         ws = Path(task.workspace_dir)
-        name = workspace.read_speaker_names(ws).get(label)
+        correction_snapshot, correction_state = _correction_snapshot(task, raw)
+        name = _effective_speaker_names(ws, correction_snapshot, correction_state).get(label)
         if not name:
             raise HTTPException(status_code=400, detail="请先命名说话人，再存入声纹库")
         error = _ingest_voiceprint(root, manager, task, label, name, segments)
