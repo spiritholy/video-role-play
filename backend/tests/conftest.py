@@ -239,9 +239,11 @@ class CannedEmbedder:
 
     name = "canned-embedder"
 
-    def __init__(self, regions=(), default: list[float] | None = None):
+    def __init__(self, regions=(), default: list[float] | None = None,
+                 gate: threading.Event | None = None):
         self.regions = [(float(a), float(b), list(v)) for a, b, v in regions]
         self.default = default or [0.0, 0.0, 0.0, 0.0]
+        self.gate = gate
         self.calls: list[tuple[Path, tuple[tuple[float, float], ...]]] = []
 
     def embed(self, wav: Path, windows, on_progress):
@@ -256,6 +258,9 @@ class CannedEmbedder:
                     break
             out.append(list(vec))
             on_progress(0.5)
+            if self.gate is not None:
+                self.gate.wait(timeout=60)
+                self.gate.clear()
         on_progress(1.0)
         return tuple(out)
 

@@ -10,7 +10,10 @@ import pytest
 
 from app.envfile import load_env_file
 
-VARS = ("HF_TOKEN", "HUGGINGFACE_TOKEN", "VRP_WORKSPACE_ROOT", "SOME_KEY", "COMMENTED_KEY")
+VARS = (
+    "HF_TOKEN", "HF_ENDPOINT", "HUGGINGFACE_TOKEN",
+    "VRP_WORKSPACE_ROOT", "SOME_KEY", "COMMENTED_KEY",
+)
 
 
 @pytest.fixture(autouse=True)

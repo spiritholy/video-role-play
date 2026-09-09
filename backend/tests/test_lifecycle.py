@@ -19,14 +19,13 @@ def test_提交源视频创建任务并运行到分析完成(client, tmp_path):
     assert done["erase"] is None, "尚未发起擦除"
     assert done["output_path"] is None, "分析完成不产成品，成品由擦除动作生成"
 
-    # 状态与阶段轨迹：①–④ 分析完成（含认人/纠错），⑤–⑥ 待用户触发
+    # 状态与阶段轨迹：①–④ 分析完成，⑤–⑥ 待用户触发
     stages = {s["id"]: s["status"] for s in done["stages"]}
     assert stages == {
         "audio_extract": "done",
         "separate": "done",
         "diarize": "done",
-        "recognize": "done",
-        "transcribe": "done",
+            "transcribe": "done",
         "mask_erase": "pending",
         "encode_mux": "pending",
     }

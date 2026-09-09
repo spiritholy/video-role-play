@@ -28,15 +28,13 @@ STATE_LABELS = {
     TaskState.CANCELLED: "已取消",
 }
 
-# 处理任务阶段（spec #1：①提取 → ②分离 → ③说话人分离 → ③.5 认人/纠错
-# → ④样本转写 → ⑤掩码合成 → ⑥编码封装；分析阶段为 ①–④ 加认人/纠错，
-# ⑤–⑥ 由用户选定目标说话人后经擦除动作触发。认人/纠错是 spec #9 新增：
-# 用声纹库给说话人自动命名、合并同人簇、纠正标错段）
+# 处理任务阶段（①提取 → ②分离 → ③说话人分离 → ④样本转写
+# → ⑤掩码合成 → ⑥编码封装；分析阶段为 ①–④，⑤–⑥ 由用户选定目标
+# 说话人后经擦除动作触发。声纹校验是用户显式触发的按需动作，不占阶段链）
 STAGE_DEFS = [
     ("audio_extract", "音轨提取/降混"),
     ("separate", "人声/伴奏分离"),
     ("diarize", "说话人分离"),
-    ("recognize", "认人/纠错"),
     ("transcribe", "样本转写"),
     ("mask_erase", "掩码合成"),
     ("encode_mux", "编码封装"),
@@ -91,6 +89,8 @@ class Task:
     # 最近一次擦除请求：{"speakers": [标签...], "output_dir": str | None}；
     # None 表示尚未发起擦除（分析完成后由用户经 API 发起）
     erase: dict | None = None
+    # 按需声纹校验的内存态进度；cancel_event 不进入 API 快照。
+    voiceprint_check: dict | None = None
     cancel_event: threading.Event = field(
         default_factory=threading.Event, repr=False, compare=False
     )
@@ -126,4 +126,13 @@ def snapshot(task: Task) -> dict:
         "output_path": task.output_path,
         "workspace_dir": task.workspace_dir,
         "erase": dict(task.erase) if task.erase else None,
+        "voiceprint_check": (
+            {
+                k: v
+                for k, v in (task.voiceprint_check or {}).items()
+                if k not in {"cancel_event", "result"}
+            }
+            if task.voiceprint_check is not None
+            else None
+        ),
     }

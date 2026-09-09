@@ -111,7 +111,7 @@ def effective_segments(
     snapshot: dict | None = None,
     base_fingerprint: str | None = None,
 ) -> list[dict]:
-    """统一生效时段解析：人工校正 > 认人/纠错 > 原始说话人分离。"""
+    """统一生效时段解析：人工校正 > 原始说话人分离。"""
     if snapshot_state(raw_segments, snapshot, base_fingerprint) == "active":
         return _valid_segments(snapshot.get("segments")) or []
     segments = (

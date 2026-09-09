@@ -79,8 +79,7 @@ def test_转写失败后续跑_分离与说话人分离零调用(tmp_path):
             "audio_extract": "done",
             "separate": "done",
             "diarize": "done",
-            "recognize": "done",
-            "transcribe": "done",
+                    "transcribe": "done",
             "mask_erase": "pending",
             "encode_mux": "pending",
         }
@@ -134,8 +133,7 @@ def test_取消运行中任务_已完成产物保留且可续跑(tmp_path):
             "audio_extract": "done",
             "separate": "done",
             "diarize": "cancelled",
-            "recognize": "pending",
-            "transcribe": "pending",
+                    "transcribe": "pending",
             "mask_erase": "pending",
             "encode_mux": "pending",
         }, "取消应停止当前及后续阶段"

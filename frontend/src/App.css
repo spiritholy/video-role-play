@@ -653,6 +653,7 @@ button.delete {
   margin-left: auto;
 }
 
+
 .correction-warning {
   margin: 0;
   font-size: 13px;
@@ -782,4 +783,51 @@ button.delete {
   justify-content: flex-end;
   gap: 8px;
   margin-top: 16px;
+}
+
+/* 按需声纹校验：建议列表为待确认状态，不接受自动应用 */
+.voiceprint-check {
+  margin-top: 12px;
+  padding: 10px 12px;
+  border: 1px solid #2f3b52;
+  border-radius: 10px;
+  background: #172033;
+}
+
+.voiceprint-check-head {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.voiceprint-check-head span {
+  color: #a8b3c7;
+  font-size: 12px;
+}
+
+.suggestion-list {
+  margin: 10px 0 0;
+  padding-left: 0;
+  list-style: none;
+  display: grid;
+  gap: 8px;
+}
+
+.suggestion {
+  display: grid;
+  grid-template-columns: auto 1fr auto;
+  gap: 8px;
+  align-items: center;
+  font-size: 12px;
+}
+
+.suggestion-type {
+  padding: 2px 6px;
+  border-radius: 999px;
+  background: #253249;
+  color: #b9c4d6;
+}
+
+.suggestion-state {
+  color: #e8a13a;
 }

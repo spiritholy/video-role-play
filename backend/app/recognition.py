@@ -1,11 +1,11 @@
-"""认人/纠错：用声纹库给说话人自动命名、合并同人簇、纠正标错段。
+"""声纹比对算法：用声纹库建议命名、合并同人簇、改派标错段。
 
 纯函数模块：不碰 ML 推理与文件系统。管线负责抽声纹（经推理注入容器的
 embedder，一律使用 人声轨 避开背景音乐污染），本模块只做向量比较与时段
-修正。算法（spec #9）：每簇取最多 5 个最长时段抽声纹求质心，与库做余弦
-相似度 ≥ 匹配阈值才命名；同名多簇合并到说话时长最长的规范标签；对 ≥ 2
-秒的时段做逐段验证，若某库名字相似度 ≥ 验证阈值且领先当前归属超过
-margin，则重指派回该名字（该名字本集无标签时新建规范标签）。
+建议。算法（spec #9）：每簇取最多 5 个最长时段抽声纹求质心，与库做余弦
+相似度 ≥ 匹配阈值才建议命名；同名多簇建议合并到说话时长最长的规范标签；
+对 ≥ 2 秒的时段做逐段验证，若某库名字相似度 ≥ 验证阈值且领先当前归属超过
+margin，则建议改派回该名字。函数只描述建议，不修改任何生效数据。
 """
 
 from __future__ import annotations
@@ -99,12 +99,13 @@ def plan_embeddings(segments: Sequence[SpeakerSegment]) -> RecognitionPlan:
 
 @dataclass(frozen=True)
 class RecognitionResult:
-    """认人/纠错结果：自动命名映射 + 修正后时段。"""
+    """声纹比对结果：若直接应用会是命名映射/修正后时段；建议仅持久化。"""
 
     mapping: dict[str, str]
     segments: tuple[SpeakerSegment, ...]
     library_revision: int
     used_library: bool
+    suggestions: tuple[dict, ...] = ()
 
 
 def apply_recognition(
@@ -114,11 +115,11 @@ def apply_recognition(
     name_vectors: dict[str, Sequence[Sequence[float]]],
     library_revision: int,
 ) -> RecognitionResult:
-    """核心算法（纯函数）：簇匹配 → 同名合并 → 逐段验证重指派。
+    """核心算法（纯函数）：簇匹配 → 同名合并 → 逐段验证改派建议。
 
     name_vectors：库中每个名字的声纹向量集（已按当前 embedder 模型过滤，
     由调用方负责）；vectors_by_window：窗口 → 向量（窗口来自 plan）。
-    有效库为空时返回恒等（与现状完全一致）。
+    有效库为空时返回恒等且无建议。
     """
     name_centroids = {
         name: centroid(vs) for name, vs in name_vectors.items() if vs
@@ -168,6 +169,25 @@ def apply_recognition(
         canonical: name for name, canonical in canonical_of.items()
     }
     label_of_name: dict[str, str] = dict(canonical_of)
+    suggestions: list[dict] = [
+        {
+            "type": "rename",
+            "label": label,
+            "name": name,
+            "similarity": float(sim),
+        }
+        for label, (name, sim) in sorted(matched.items())
+    ]
+    suggestions.extend(
+        {
+            "type": "merge",
+            "name": name,
+            "labels": sorted(labels),
+            "canonical": canonical_of[name],
+        }
+        for name, labels in sorted(name_groups.items())
+        if len(labels) > 1
+    )
 
     verify_by_index = dict(plan.verify_windows)
 
@@ -189,6 +209,19 @@ def apply_recognition(
                         else 0.0
                     )
                     if cand_sim - current_sim > REASSIGN_MARGIN:
+                        suggestions.append(
+                            {
+                                "type": "reassign",
+                                "from_label": seg.speaker,
+                                "to_label": label_of_name.setdefault(
+                                    cand_name, cand_name
+                                ),
+                                "name": cand_name,
+                                "start": float(seg.start),
+                                "end": float(seg.end),
+                                "similarity": float(cand_sim),
+                            }
+                        )
                         eff = label_of_name.setdefault(cand_name, cand_name)
                         mapping[eff] = cand_name
         corrected.append(SpeakerSegment(eff, seg.start, seg.end))
@@ -198,6 +231,7 @@ def apply_recognition(
         segments=tuple(corrected),
         library_revision=library_revision,
         used_library=True,
+        suggestions=tuple(suggestions),
     )
 
 

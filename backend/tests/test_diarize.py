@@ -45,7 +45,7 @@ def test_完成后工作区存在说话人时段产物且清单更新(client, tm
     assert {"speaker": "SPEAKER_00", "start": 1.3, "end": 1.8} in data["segments"]
 
     manifest = json.loads((ws / "manifest.json").read_text(encoding="utf-8"))
-    assert [s["status"] for s in manifest["stages"]] == ["done"] * 5 + ["pending"] * 2  # 分析完成；掩码合成/编码封装待擦除触发
+    assert [s["status"] for s in manifest["stages"]] == ["done"] * 4 + ["pending"] * 2  # 分析完成；掩码合成/编码封装待擦除触发
     assert manifest["diarization"] == {
         "model": "canned-diarizer",
         "requested_num_speakers": None,

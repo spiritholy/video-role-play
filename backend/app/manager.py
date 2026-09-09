@@ -31,6 +31,10 @@ class TaskNotResumable(Exception):
     """任务当前状态没有断点可续（只有失败/已取消的任务可续跑）。"""
 
 
+class TaskCheckActive(Exception):
+    """已有声纹校验在运行（校验须显式取消后才能重启）。"""
+
+
 class TaskManager:
     def __init__(self, workspace_root: Path, inference: Inference | None = None):
         self._workspace_root = Path(workspace_root)
@@ -48,6 +52,8 @@ class TaskManager:
         self._thread = threading.Thread(
             target=self._worker, daemon=True, name="task-worker"
         )
+        self._check_thread: threading.Thread | None = None
+        self._check_event = threading.Event()
 
     def start(self) -> None:
         self._thread.start()
@@ -200,6 +206,82 @@ class TaskManager:
                 task.workspace_dir == workspace_dir
                 and task.state in (TaskState.QUEUED, TaskState.RUNNING)
                 for task in self._tasks.values()
+            )
+
+    def start_voiceprint_check(self, task_id: str) -> Task:
+        """显式启动按需声纹校验；同一时刻全局只允许一个校验线程。"""
+        with self._lock:
+            task = self._tasks.get(task_id)
+            if task is None or task.workspace_dir is None:
+                raise KeyError(task_id)
+            if task.state in (TaskState.QUEUED, TaskState.RUNNING):
+                raise TaskNotErasable(task.state.value)
+            if self._check_thread is not None and self._check_thread.is_alive():
+                raise TaskCheckActive(task_id)
+            cancel_event = threading.Event()
+            task.voiceprint_check = {
+                "state": "queued",
+                "progress": 0.0,
+                "error": None,
+                "cancel_requested": False,
+                "cancel_event": cancel_event,
+            }
+            self._check_event = cancel_event
+            self._check_thread = threading.Thread(
+                target=self._run_voiceprint_check,
+                args=(task, cancel_event),
+                daemon=True,
+                name=f"voiceprint-check-{task_id}",
+            )
+        self._check_thread.start()
+        return task
+
+    def cancel_voiceprint_check(self, task_id: str) -> Task:
+        """请求取消声纹校验；校验线程在下一个取消点停止。"""
+        with self._lock:
+            task = self._tasks.get(task_id)
+            if task is None or task.voiceprint_check is None:
+                raise KeyError(task_id)
+            state = task.voiceprint_check.get("state")
+            if state not in ("queued", "running"):
+                raise TaskNotCancellable(state)
+            task.voiceprint_check["cancel_requested"] = True
+            event = task.voiceprint_check.get("cancel_event")
+            if event is not None:
+                event.set()
+            return task
+
+    def _run_voiceprint_check(
+        self, task: Task, cancel_event: threading.Event
+    ) -> None:
+        def set_state(**changes) -> None:
+            with self._lock:
+                if task.voiceprint_check is None:
+                    return
+                task.voiceprint_check.update(changes)
+
+        set_state(state="running", started_at=now_iso())
+        try:
+            data = pipeline.run_voiceprint_check(
+                task,
+                self.inference,
+                cancel_event,
+                on_progress=lambda fraction: set_state(
+                    progress=max(0.0, min(1.0, float(fraction)))
+                ),
+            )
+            set_state(
+                state="completed",
+                progress=1.0,
+                result=data,
+                finished_at=now_iso(),
+            )
+        except Exception as e:
+            cancelled = cancel_event.is_set()
+            set_state(
+                state="cancelled" if cancelled else "failed",
+                error=None if cancelled else (str(e) or repr(e)),
+                finished_at=now_iso(),
             )
 
     def _worker(self) -> None:

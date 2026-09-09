@@ -116,7 +116,32 @@ interface Task {
   output_path: string | null;
   workspace_dir: string | null;
   erase: { speakers: string[]; output_dir: string | null } | null;
+  voiceprint_check?: VoiceprintCheckState | null;
   created_at: string;
+}
+
+interface VoiceprintSuggestion {
+  type: "rename" | "merge" | "reassign";
+  label?: string;
+  name?: string;
+  similarity?: number;
+  labels?: string[];
+  canonical?: string;
+  from_label?: string;
+  to_label?: string;
+  start?: number;
+  end?: number;
+}
+
+interface VoiceprintCheckResult {
+  suggestions: VoiceprintSuggestion[];
+}
+
+interface VoiceprintCheckState {
+  state: "not_run" | "queued" | "running" | "completed" | "failed" | "cancelled";
+  progress: number;
+  error: string | null;
+  result?: VoiceprintCheckResult | null;
 }
 
 interface ProbeTrack {
@@ -217,10 +242,13 @@ export default function App() {
   // 命名入库失败警告（任务 → 文案）：仅前端会话态，下次命名成功或刷新即清除。
   const [ingestWarnings, setIngestWarnings] = useState<Record<string, string | null>>({});
   const [voiceprintBusy, setVoiceprintBusy] = useState<Record<string, boolean>>({});
+  const [checkStates, setCheckStates] = useState<Record<string, VoiceprintCheckState>>({});
+  const [checkError, setCheckError] = useState<string | null>(null);
   const [playing, setPlaying] = useState<Playing | null>(null);
   const [correctionError, setCorrectionError] = useState<Record<string, string | null>>({});
   const audioRef = useRef<HTMLAudioElement | null>(null);
   const requestedTranscripts = useRef<Set<string>>(new Set());
+  const requestedChecks = useRef<Set<string>>(new Set());
   const [videoPath, setVideoPath] = useState("");
   const [probe, setProbe] = useState<ProbeResult | null>(null);
   const [selectedTrack, setSelectedTrack] = useState(0);
@@ -417,6 +445,21 @@ export default function App() {
     [],
   );
 
+  const maybeFetchCheck = useCallback(async (t: Task) => {
+    if (!t.stages.some((s) => s.id === "diarize" && s.status === "done")) return;
+    const active = t.voiceprint_check && ["queued", "running"].includes(t.voiceprint_check.state);
+    if (!active && requestedChecks.current.has(t.id)) return;
+    requestedChecks.current.add(t.id);
+    try {
+      const resp = await fetch(`/api/tasks/${t.id}/voiceprint-check`);
+      if (!resp.ok) return;
+      const data: VoiceprintCheckState = await resp.json();
+      setCheckStates((prev) => ({ ...prev, [t.id]: data }));
+    } catch {
+      // 下一轮轮询重试
+    }
+  }, []);
+
   const refreshWorkspaces = useCallback(async () => {
     try {
       const resp = await fetch("/api/workspaces");
@@ -444,12 +487,13 @@ export default function App() {
       setTasks(data.tasks);
       data.tasks.forEach(maybeFetchTimeline);
       data.tasks.forEach(maybeFetchTranscripts);
+      data.tasks.forEach(maybeFetchCheck);
     } catch {
       // 后端暂不可达时保留旧列表，下一轮重试
     }
     refreshWorkspaces();
     refreshVoiceprints();
-  }, [maybeFetchTimeline, maybeFetchTranscripts, refreshWorkspaces, refreshVoiceprints]);
+  }, [maybeFetchTimeline, maybeFetchTranscripts, maybeFetchCheck, refreshWorkspaces, refreshVoiceprints]);
 
   useEffect(() => {
     refresh();
@@ -752,6 +796,93 @@ export default function App() {
     );
   }
 
+  async function startVoiceprintCheck(t: Task) {
+    setCheckError(null);
+    try {
+      const resp = await fetch(`/api/tasks/${t.id}/voiceprint-check`, { method: "POST" });
+      if (!resp.ok) {
+        const data = await resp.json().catch(() => null);
+        setCheckError(data?.detail ?? "声纹校验启动失败");
+        return;
+      }
+      const data = await resp.json();
+      if (data.voiceprint_check) {
+        setCheckStates((prev) => ({
+          ...prev,
+          [t.id]: { ...data.voiceprint_check, result: null },
+        }));
+      }
+    } catch {
+      setCheckError("无法连接后端服务");
+    }
+  }
+
+  async function cancelVoiceprintCheck(t: Task) {
+    setCheckError(null);
+    try {
+      const resp = await fetch(`/api/tasks/${t.id}/voiceprint-check`, { method: "DELETE" });
+      if (!resp.ok) {
+        const data = await resp.json().catch(() => null);
+        setCheckError(data?.detail ?? "取消声纹校验失败");
+      }
+    } catch {
+      setCheckError("无法连接后端服务");
+    }
+  }
+
+  function suggestionText(s: VoiceprintSuggestion): string {
+    const pct = (v?: number) => (v == null ? "" : ` · 相似度 ${Math.round(v * 100)}%`);
+    if (s.type === "rename") return `建议把 ${s.label} 命名为「${s.name}」${pct(s.similarity)}`;
+    if (s.type === "merge") return `建议合并同名簇 ${s.labels?.join("、")} 为 ${s.canonical}`;
+    return `建议把 ${s.start?.toFixed(1)}s–${s.end?.toFixed(1)}s 从 ${s.from_label} 改派给「${s.name}」${pct(s.similarity)}`;
+  }
+
+  function renderVoiceprintCheck(t: Task) {
+    const check = t.voiceprint_check && ["queued", "running"].includes(t.voiceprint_check.state)
+      ? t.voiceprint_check
+      : checkStates[t.id];
+    if (!check) return null;
+    const active = check.state === "queued" || check.state === "running";
+    return (
+      <div className="voiceprint-check">
+        <div className="voiceprint-check-head">
+          <strong>声纹库校验</strong>
+          {active ? (
+            <>
+              <span>{Math.round((check.progress ?? 0) * 100)}%</span>
+              <button className="cancel" onClick={() => cancelVoiceprintCheck(t)}>取消</button>
+            </>
+          ) : (
+            <button className="resume" onClick={() => startVoiceprintCheck(t)}>用声纹库校验</button>
+          )}
+        </div>
+        {active && (
+          <div className="stage-progress" role="progressbar" aria-valuemin={0} aria-valuemax={100} aria-valuenow={Math.round((check.progress ?? 0) * 100)}>
+            <span className="stage-progress-fill" style={{ width: `${Math.round((check.progress ?? 0) * 100)}%` }} />
+          </div>
+        )}
+        {check.state === "failed" && <p className="error-text">{check.error ?? "声纹校验失败"}</p>}
+        {check.state === "cancelled" && <p className="timeline-hint">声纹校验已取消。</p>}
+        {check.state === "not_run" && <p className="timeline-hint">尚未校验。此操作只生成建议，不会直接修改时段。</p>}
+        {check.result?.suggestions?.length ? (
+          <ul className="suggestion-list">
+            {check.result.suggestions.map((s, i) => (
+              <li key={i} className="suggestion">
+                <span className="suggestion-type">
+                  {s.type === "rename" ? "命名" : s.type === "merge" ? "合并" : "改派"}
+                </span>
+                <span>{suggestionText(s)}</span>
+                <span className="suggestion-state">待确认</span>
+              </li>
+            ))}
+          </ul>
+        ) : check.state === "completed" ? (
+          <p className="timeline-hint">校验完成，未产生建议。</p>
+        ) : null}
+      </div>
+    );
+  }
+
   return (
     <main className="app">
       <h1>视频人声擦除</h1>
@@ -813,6 +944,7 @@ export default function App() {
       <section className="tasks">
         <h2>处理任务</h2>
         {resumeError && <p className="error-text">{resumeError}</p>}
+        {checkError && <p className="error-text">{checkError}</p>}
         {tasks.length === 0 && <p className="empty">还没有任务，提交一个源视频开始。</p>}
         {tasks.map((t) => {
           const cancellable = t.state === "queued" || t.state === "running";
@@ -884,6 +1016,8 @@ export default function App() {
                   </div>
                 ))}
               {t.stages.some((s) => s.id === "diarize" && s.status === "done") &&
+                renderVoiceprintCheck(t)}
+              {t.stages.some((s) => s.id === "diarize" && s.status === "done") &&
                 renderTimeline(t)}
               {t.error && <p className="error-text">失败原因：{t.error}</p>}
               {t.output_path && (
@@ -908,8 +1042,8 @@ export default function App() {
             )}
           </div>
           <p className="voiceprint-hint">
-            在说话人列表中显式存入声纹，后续剧集据此自动认人/纠错（带「自动」标记，
-            手工命名永远优先）。同名人物再次存入会追加声纹。误入库的人物可在此删除。
+            在说话人列表中显式存入声纹；跨视频复用需点击「用声纹库校验」。
+            校验只给出命名、合并、改派建议，经你确认后才会修改。误入库的人物可在此删除。
           </p>
           {voiceprintError && <p className="error-text">{voiceprintError}</p>}
           {voiceprints && voiceprints.names.length === 0 && (

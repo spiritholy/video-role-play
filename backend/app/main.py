@@ -21,12 +21,14 @@ from . import corrections, voiceprints, workspace
 from .inference import Inference, SpeakerSegment
 from .manager import (
     TaskManager,
+    TaskCheckActive,
     TaskNotCancellable,
     TaskNotErasable,
     TaskNotResumable,
 )
 from .media import TaskError, audio_tracks, ffprobe_json, run_ffmpeg_bytes
 from .models import TaskState, snapshot
+from .pipeline import VOICEPRINT_CHECK_DIR, VOICEPRINT_CHECK_FILENAME
 from .recognition import middle_window
 from .samples import select_samples
 
@@ -95,17 +97,14 @@ def _load_diarization(task) -> dict:
         raise HTTPException(status_code=404, detail="说话人分离产物缺失")
 
 
-def _read_recognition(task) -> dict | None:
-    """认人/纠错产物；阶段未完成或产物缺失返回 None（回退原始结果）。"""
-    stage = _stage_of(task, "recognize")
-    artifact = stage.outputs.get("recognition") if stage else None
-    if artifact is None:
-        return None
-    path = Path(task.workspace_dir) / artifact
+def _read_voiceprint_check(ws: Path) -> dict | None:
+    """按需声纹校验建议；缺失/损坏返回 None（不当作已校验）。"""
+    path = ws / VOICEPRINT_CHECK_DIR / VOICEPRINT_CHECK_FILENAME
     try:
         return json.loads(path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError):
         return None
+
 
 
 def _diarization_fingerprint(raw: dict) -> str:
@@ -127,14 +126,13 @@ def _correction_snapshot(task, raw: dict) -> tuple[dict | None, str]:
 
 
 def _effective_segments(task, raw: dict, snapshot: dict | None) -> list[dict]:
-    """统一生效时段：人工校正 > 认人/纠错 > 原始说话人分离。
+    """统一生效时段：人工校正 > 原始说话人分离。
 
-    时间轴、命名与擦除校验统一走这里，保证界面看到的人物与擦除语义一致。
+    时间轴、命名与擦除校验统一走这里。旧自动认人产物不再是生效层。
     """
-    recognition = _read_recognition(task)
     return corrections.effective_segments(
         raw.get("segments", []),
-        recognition,
+        None,
         snapshot,
         _diarization_fingerprint(raw),
     )
@@ -167,6 +165,7 @@ def _correction_status(
         "editable": True,
         "locked_reason": None,
     }
+
 
 
 def _ingest_voiceprint(
@@ -485,7 +484,9 @@ def create_app(
             "tracks": tracks,
         }
 
+
     def _timeline_payload(task) -> dict:
+
         raw = _load_diarization(task)
         snapshot, state = _correction_snapshot(task, raw)
         segments = _effective_segments(task, raw, snapshot)
@@ -505,20 +506,13 @@ def create_app(
                 {"start": turn["start"], "end": turn["end"], "index": turn["index"]}
             )
         names = workspace.read_speaker_names(Path(task.workspace_dir))
-        recognition = _read_recognition(task)
-        auto_names = {
-            str(k): str(v)
-            for k, v in (recognition.get("mapping") or {}).items()
-        } if recognition else {}
         rows = []
         for k in sorted(speakers):
             manual = names.get(k)
-            auto = auto_names.get(k)
             rows.append(
                 {
                     **speakers[k],
-                    "name": manual if manual is not None else auto,
-                    "auto": manual is None and auto is not None,
+                    "name": manual,
                 }
             )
         return {
@@ -530,6 +524,7 @@ def create_app(
                 task, snapshot, state, manager.workspace_busy(str(task.workspace_dir))
             ),
         }
+
 
     @app.get("/api/tasks/{task_id}/diarization")
     def get_diarization(task_id: str):
@@ -604,6 +599,66 @@ def create_app(
         corrections.discard(Path(task.workspace_dir))
         return _timeline_payload(task)
 
+    @app.post("/api/tasks/{task_id}/voiceprint-check")
+    def start_voiceprint_check(task_id: str):
+        """显式触发声纹库校验：按需运行，只产出待确认建议。"""
+        task = _require_task(manager, task_id)
+        if task.state in (TaskState.QUEUED, TaskState.RUNNING):
+            raise HTTPException(status_code=409, detail="任务正在排队或运行中，无法校验")
+        if manager.workspace_busy(str(task.workspace_dir)):
+            raise HTTPException(status_code=409, detail="工作区正在被任务使用，无法校验")
+        library = voiceprints.read_library(root)
+        if not voiceprints.effective_entries(
+            library, manager.inference.embedder.name
+        ):
+            raise HTTPException(
+                status_code=409,
+                detail="声纹库为空：请先给说话人命名并存入声纹，再执行校验",
+            )
+        try:
+            task = manager.start_voiceprint_check(task_id)
+        except KeyError:
+            raise HTTPException(status_code=404, detail="任务不存在")
+        except TaskCheckActive:
+            raise HTTPException(status_code=409, detail="声纹校验正在运行，请先取消")
+        except TaskNotErasable:
+            raise HTTPException(status_code=409, detail="任务正在排队或运行中，无法校验")
+        return snapshot(task)
+
+    @app.get("/api/tasks/{task_id}/voiceprint-check")
+    def get_voiceprint_check(task_id: str):
+        """读取校验进度/取消状态；完成后返回工作区持久化的建议列表。"""
+        task = manager.get(task_id)
+        if task is not None and task.voiceprint_check is not None:
+            state = dict(task.voiceprint_check)
+            return {
+                "state": state.get("state"),
+                "progress": state.get("progress", 0.0),
+                "error": state.get("error"),
+                "result": state.get("result"),
+            }
+        if task is None:
+            raise HTTPException(status_code=404, detail="任务不存在")
+        persisted = _read_voiceprint_check(Path(task.workspace_dir))
+        return {
+            "state": "completed" if persisted else "not_run",
+            "progress": 1.0 if persisted else 0.0,
+            "error": None,
+            "result": persisted,
+        }
+
+    @app.delete("/api/tasks/{task_id}/voiceprint-check")
+    def cancel_voiceprint_check(task_id: str):
+        """取消正在运行的声纹校验（与阶段链任务取消相互独立）。"""
+        try:
+            task = manager.cancel_voiceprint_check(task_id)
+        except KeyError:
+            raise HTTPException(status_code=404, detail="任务不存在")
+        except TaskNotCancellable:
+            raise HTTPException(status_code=409, detail="声纹校验已结束，无法取消")
+        return snapshot(task)
+
+
     @app.put("/api/tasks/{task_id}/speakers/{label}/name")
     def rename_speaker(task_id: str, label: str, body: SpeakerNameIn):
         """命名/改名/清除：纯本地写入工作区元数据，不触碰声纹库。
@@ -647,13 +702,7 @@ def create_app(
         if label not in known:
             raise HTTPException(status_code=404, detail="说话人不存在")
         ws = Path(task.workspace_dir)
-        recognition = _read_recognition(task)
-        auto_names = (
-            {str(k): str(v) for k, v in (recognition.get("mapping") or {}).items()}
-            if recognition
-            else {}
-        )
-        name = workspace.read_speaker_names(ws).get(label) or auto_names.get(label)
+        name = workspace.read_speaker_names(ws).get(label)
         if not name:
             raise HTTPException(status_code=400, detail="请先命名说话人，再存入声纹库")
         error = _ingest_voiceprint(root, manager, task, label, name, segments)

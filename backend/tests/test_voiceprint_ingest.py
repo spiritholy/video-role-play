@@ -4,16 +4,15 @@
 可观察行为；声纹抽取注入 CannedEmbedder，真实模型与权重下载不进入测试。
 """
 
-import json
-from pathlib import Path
-
 from app import voiceprints
 
 from conftest import (
+    CannedDiarizer,
     CannedEmbedder,
     make_client,
     make_video,
     run_to_analysis,
+    SpeakerSegment,
 )
 
 
@@ -100,22 +99,20 @@ def test_同名人物再次入库_追加向量且不超过6个(tmp_path):
 
 def test_入库使用当前生效时段(tmp_path):
     embedder = CannedEmbedder()
-    with make_client(tmp_path, embedder=embedder) as client:
+    turns = (SpeakerSegment("SPEAKER_00", 0.2, 0.9),)
+    diarizer = CannedDiarizer(turns=turns)
+    with make_client(tmp_path, diarizer=diarizer, embedder=embedder) as client:
         task = run_to_analysis(client, make_video(tmp_path, "校正.mp4"))
-        ws = Path(task["workspace_dir"])
-        recognition_path = ws / "03b-recognize" / "recognition.json"
-        recognition = json.loads(recognition_path.read_text(encoding="utf-8"))
-        recognition["segments"] = [
-            {"speaker": "SPEAKER_00", "start": 0.2, "end": 1.8}
-        ]
-        recognition_path.write_text(
-            json.dumps(recognition, ensure_ascii=False), encoding="utf-8"
+        resp = client.put(
+            f"/api/tasks/{task['id']}/segments/0/boundary",
+            json={"side": "end", "new_time": 1.8},
         )
+        assert resp.status_code == 200, resp.text
 
         rename(client, task["id"], "SPEAKER_00", "男主")
         resp = store(client, task["id"], "SPEAKER_00")
         assert resp.status_code == 200, resp.text
-        assert embedder.calls[-1][1] == ((0.2, 1.8),), "应抽取合并后的生效时段"
+        assert embedder.calls[-1][1] == ((0.2, 1.8),), "应抽取校正后的生效时段"
 
 
 def test_未命名说话人拒绝入库(tmp_path):
