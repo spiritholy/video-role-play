@@ -103,16 +103,22 @@ def test_入库使用当前生效时段(tmp_path):
     diarizer = CannedDiarizer(turns=turns)
     with make_client(tmp_path, diarizer=diarizer, embedder=embedder) as client:
         task = run_to_analysis(client, make_video(tmp_path, "校正.mp4"))
+        # 切分把原时段 0.2–0.9 拆成两段：前段保留 SPEAKER_00，后段新建说话人。
         resp = client.put(
-            f"/api/tasks/{task['id']}/segments/0/boundary",
-            json={"side": "end", "new_time": 1.8},
+            f"/api/tasks/{task['id']}/segments/0/split",
+            json={
+                "results": [
+                    {"start": 0.2, "end": 0.5, "target": "SPEAKER_00"},
+                    {"start": 0.5, "end": 0.9, "target": "__new__", "slot": "a"},
+                ]
+            },
         )
         assert resp.status_code == 200, resp.text
 
         rename(client, task["id"], "SPEAKER_00", "男主")
         resp = store(client, task["id"], "SPEAKER_00")
         assert resp.status_code == 200, resp.text
-        assert embedder.calls[-1][1] == ((0.2, 1.8),), "应抽取校正后的生效时段"
+        assert embedder.calls[-1][1] == ((0.2, 0.5),), "应抽取校正后的生效时段"
 
 
 def test_未命名说话人拒绝入库(tmp_path):

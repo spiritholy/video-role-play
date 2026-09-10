@@ -3,7 +3,6 @@
 import pytest
 
 from app.corrections import (
-    apply_boundary_move,
     apply_reassignment,
     diarization_fingerprint,
     effective_segments,
@@ -74,55 +73,6 @@ def test_快照状态按基础分离指纹作废():
     assert snapshot_state(changed, snapshot) == "invalidated"
     assert snapshot_state(BASE, {"segments": BASE}) == "invalidated"
     assert snapshot_state(BASE, None) == "none"
-
-
-SHARED = [
-    {"speaker": "SPEAKER_00", "start": 0.2, "end": 0.9},
-    {"speaker": "SPEAKER_01", "start": 0.9, "end": 1.25},
-    {"speaker": "SPEAKER_00", "start": 1.3, "end": 1.8},
-]
-
-
-def test_相邻段共享边界双向联动且无重叠空洞():
-    snapshot = apply_boundary_move(SHARED, None, 0, "end", 1.05)
-    assert snapshot["segments"][0]["end"] == 1.05
-    assert snapshot["segments"][1]["start"] == 1.05
-    assert snapshot["revision"] == 1
-
-    snapshot = apply_boundary_move(SHARED, snapshot, 1, "start", 1.0)
-    assert snapshot["segments"][0]["end"] == 1.0
-    assert snapshot["segments"][1]["start"] == 1.0
-    assert snapshot["revision"] == 2
-
-
-def test_边界可自由延伸进空隙但撞邻居钳制():
-    snapshot = apply_boundary_move(BASE, None, 0, "end", 0.93)
-    assert snapshot["segments"][0]["end"] == 0.93
-    assert snapshot["segments"][1]["start"] == 0.95
-
-    snapshot = apply_boundary_move(BASE, None, 0, "end", 1.4)
-    assert snapshot["segments"][0]["end"] == snapshot["segments"][1]["start"]
-    assert snapshot["segments"][0]["end"] <= 0.95
-    assert snapshot["segments"][0]["start"] < snapshot["segments"][0]["end"]
-
-    snapshot = apply_boundary_move(BASE, None, 1, "start", 0.93)
-    assert snapshot["segments"][1]["start"] == 0.93
-    assert snapshot["segments"][0]["end"] == 0.9
-
-    snapshot = apply_boundary_move(BASE, None, 1, "start", 0.4)
-    assert snapshot["segments"][1]["start"] == 0.9
-    assert snapshot["segments"][0]["end"] <= snapshot["segments"][1]["start"]
-
-
-def test_边界修改拒绝不存在时段并保持互斥():
-    with pytest.raises(ValueError):
-        apply_boundary_move(BASE, None, 99, "end", 1.0)
-    with pytest.raises(ValueError):
-        apply_boundary_move(BASE, None, 0, "end", 0.2)  # 会使前段零时长
-
-    snapshot = apply_boundary_move(BASE, None, 0, "end", 1.05)
-    ordered = sorted(snapshot["segments"], key=lambda s: s["start"])
-    assert all(a["end"] <= b["start"] for a, b in zip(ordered, ordered[1:]))
 
 
 def test_声纹改派建议按时段并入并允许命名目标():

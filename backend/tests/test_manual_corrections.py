@@ -4,9 +4,7 @@ import json
 from pathlib import Path
 
 from conftest import (
-    CannedDiarizer,
     CannedTranscriber,
-    SpeakerSegment,
     erase_to_completion,
     make_client,
     make_video,
@@ -35,13 +33,6 @@ def reassign(client, task_id, index, target):
     return client.put(
         f"/api/tasks/{task_id}/segments/{index}/speaker",
         json={"target": target},
-    )
-
-
-def boundary(client, task_id, index, side, time):
-    return client.put(
-        f"/api/tasks/{task_id}/segments/{index}/boundary",
-        json={"side": side, "new_time": time},
     )
 
 
@@ -136,9 +127,17 @@ def test_工作区任务运行中校正写操作锁定(tmp_path):
         resp = reassign(client, task["id"], 0, "SPEAKER_01")
         assert resp.status_code == 409, resp.text
         assert "排队中或运行中" in resp.json()["detail"]
-        boundary_resp = boundary(client, task["id"], 0, "end", 0.93)
-        assert boundary_resp.status_code == 409, boundary_resp.text
-        assert "排队中或运行中" in boundary_resp.json()["detail"]
+        split_resp = client.put(
+            f"/api/tasks/{task['id']}/segments/0/split",
+            json={
+                "results": [
+                    {"start": 0.2, "end": 0.5, "target": "SPEAKER_00"},
+                    {"start": 0.5, "end": 0.9, "target": "SPEAKER_01"},
+                ]
+            },
+        )
+        assert split_resp.status_code == 409, split_resp.text
+        assert "排队中或运行中" in split_resp.json()["detail"]
         transcriber.gate.set()
         wait_for(
             lambda: client.get(f"/api/tasks/{task['id']}").json()["state"] == "completed"
@@ -161,71 +160,43 @@ def test_校正变化后同目标重擦不复用旧混音(client, tmp_path):
     assert Path(second["output_path"]).is_file()
 
 
-def test_边界编辑立即保存并保持互斥(client, tmp_path):
+def test_边界移动API不可用_改派切分与放弃校正不回归(client, tmp_path):
     video = make_video(tmp_path)
     task = run_to_analysis(client, video)
-    resp = boundary(client, task["id"], 0, "end", 0.93)
-    assert resp.status_code == 200, resp.text
-    body = resp.json()
-    assert body["correction"]["revision"] == 1
-    assert segment_by_index(body, 0)[1]["end"] == 0.93
-    assert segment_by_index(body, 1)[1]["start"] == 0.95
-    assert timeline(client, task["id"]) == body
 
-
-def test_边界延伸撞邻居时钳制且不越界(client, tmp_path):
-    video = make_video(tmp_path)
-    task = run_to_analysis(client, video)
-    resp = boundary(client, task["id"], 0, "end", 1.4)
-    assert resp.status_code == 200, resp.text
-    body = resp.json()
-    assert segment_by_index(body, 0)[1]["end"] == 0.95
-    assert segment_by_index(body, 1)[1]["start"] == 0.95
-
-
-def test_相邻共享边界端点联动(tmp_path):
-    video = make_video(tmp_path)
-    turns = (
-        SpeakerSegment("SPEAKER_00", 0.2, 0.9),
-        SpeakerSegment("SPEAKER_01", 0.9, 1.25),
-        SpeakerSegment("SPEAKER_00", 1.3, 1.8),
+    # 旧边界移动端点已移除：PUT 边界不再可用（404 路由不存在 / 405 方法不允许）。
+    gone = client.put(
+        f"/api/tasks/{task['id']}/segments/0/boundary",
+        json={"side": "end", "new_time": 0.93},
     )
-    with make_client(tmp_path, diarizer=CannedDiarizer(turns=turns)) as client:
-        task = run_to_analysis(client, video)
-        resp = boundary(client, task["id"], 0, "end", 1.05)
-        assert resp.status_code == 200, resp.text
-        body = resp.json()
-        assert segment_by_index(body, 0)[1]["end"] == 1.05
-        assert segment_by_index(body, 1)[1]["start"] == 1.05
+    assert gone.status_code in (404, 405), gone.text
 
+    # 改派仍正常。
+    resp = reassign(client, task["id"], 0, "SPEAKER_01")
+    assert resp.status_code == 200, resp.text
+    assert segment_by_index(resp.json(), 0)[0]["label"] == "SPEAKER_01"
 
-def test_边界编辑校验不存在时段和非法方向(client, tmp_path):
-    video = make_video(tmp_path)
-    task = run_to_analysis(client, video)
-    missing = boundary(client, task["id"], 99, "end", 0.93)
-    assert missing.status_code == 404
-    assert missing.json()["detail"] == "说话人时段不存在"
+    # 切分仍正常：把时段 0 拆成两段，第二段改派给 SPEAKER_01。
+    split_resp = client.put(
+        f"/api/tasks/{task['id']}/segments/0/split",
+        json={
+            "results": [
+                {"start": 0.2, "end": 0.5, "target": "SPEAKER_00"},
+                {"start": 0.5, "end": 0.9, "target": "SPEAKER_01"},
+            ]
+        },
+    )
+    assert split_resp.status_code == 200, split_resp.text
+    body = split_resp.json()
+    assert body["correction"]["state"] == "active"
+    assert segment_by_index(body, 0)[0]["label"] == "SPEAKER_00"
+    assert segment_by_index(body, 1)[0]["label"] == "SPEAKER_01"
+    assert segment_by_index(body, 1)[1]["start"] == 0.5
 
-    invalid = boundary(client, task["id"], 0, "middle", 0.93)
-    assert invalid.status_code == 422
+    # 放弃全部校正仍正常：回到自动分析结果。
+    discarded = client.delete(f"/api/tasks/{task['id']}/corrections")
+    assert discarded.status_code == 200, discarded.text
+    data = timeline(client, task["id"])
+    assert data["correction"]["state"] == "none"
+    assert segment_by_index(data, 0)[0]["label"] == "SPEAKER_00"
 
-
-def test_边界修改快照随工作区继承_重新分离后编辑锁定(tmp_path):
-    video = make_video(tmp_path)
-    with make_client(tmp_path) as client:
-        first = run_to_analysis(client, video)
-        resp = boundary(client, first["id"], 0, "end", 0.93)
-        assert resp.status_code == 200, resp.text
-
-        second = run_to_analysis(client, video)
-        data = timeline(client, second["id"])
-        assert data["correction"]["state"] == "active"
-        assert segment_by_index(data, 0)[1]["end"] == 0.93
-        assert segment_by_index(data, 1)[1]["start"] == 0.95
-
-        third = run_to_analysis(client, video, num_speakers=4)
-        data = timeline(client, third["id"])
-        assert data["correction"]["state"] == "invalidated"
-        locked = boundary(client, third["id"], 0, "end", 0.93)
-        assert locked.status_code == 409, locked.text
-        assert "已作废" in locked.json()["detail"]
