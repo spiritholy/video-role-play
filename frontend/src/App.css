@@ -381,15 +381,13 @@ button.store-voiceprint:disabled {
   min-height: 20px;
   background: #eceff2;
   border-radius: 4px;
-  overflow-x: auto;
-  overflow-y: hidden;
+  overflow: hidden;
 }
 
 .timeline-track-canvas {
   position: relative;
   height: 20px;
-  min-width: 100%;
-  width: var(--timeline-track-width, 100%);
+  width: 100%;
 }
 
 .timeline-seg {
@@ -421,13 +419,8 @@ button.store-voiceprint:disabled {
   gap: 12px;
 }
 
-.timeline-axis-scroll {
-  overflow: hidden;
-}
-
 .timeline-axis-canvas {
-  width: var(--timeline-track-width, 100%);
-  min-width: 100%;
+  width: 100%;
   display: flex;
   justify-content: space-between;
   font-size: 11px;
@@ -693,13 +686,13 @@ button.delete {
   position: absolute;
   top: 3px;
   bottom: 3px;
-  min-width: 8px;
+  min-width: 1px;
 }
 
 .timeline-seg-wrap .timeline-seg {
   position: absolute;
   left: 0;
-  right: 15px;
+  right: 0;
   top: 0;
   bottom: 0;
   min-width: 0;
@@ -717,56 +710,10 @@ button.delete {
   outline-offset: 1px;
 }
 
-.timeline-seg-edit {
-  position: absolute;
-  right: 0;
-  top: 0;
-  bottom: 0;
-  width: 15px;
-  min-width: 15px;
-  padding: 0;
-  border: none;
-  border-left: 1px solid rgba(255, 255, 255, 0.7);
-  border-radius: 0 3px 3px 0;
-  background: rgba(255, 255, 255, 0.82);
-  color: #1f2329;
-  font-size: 9px;
-  line-height: 1;
-}
-
-.timeline-seg-edit:hover:not(:disabled) {
-  background: #fff;
-}
-
-.timeline-edge {
-  position: absolute;
-  top: -3px;
-  bottom: -3px;
-  width: 7px;
-  z-index: 2;
-  touch-action: none;
-  background: transparent;
-}
-
-.timeline-edge.start {
-  left: -4px;
-  cursor: ew-resize;
-}
-
-.timeline-edge.end {
-  right: -4px;
-  cursor: ew-resize;
-}
-
-.timeline-edge:hover,
-.timeline-edge:active {
-  background: rgb(79 124 255 / 40%);
-}
-
 .correction-dialog-backdrop {
   position: fixed;
   inset: 0;
-  z-index: 20;
+  z-index: 40;
   display: grid;
   place-items: center;
   background: rgba(31, 35, 41, 0.42);
@@ -872,4 +819,272 @@ button.delete {
 .suggestion-actions button {
   font-size: 11px;
   padding: 3px 8px;
+}
+
+/* 校正详情弹窗：约 1000px 宽，顶部全片总览 + 下方选中段操作面板占位 */
+.detail-modal-backdrop {
+  position: fixed;
+  inset: 0;
+  z-index: 30;
+  display: grid;
+  place-items: center;
+  background: rgba(31, 35, 41, 0.42);
+}
+
+.detail-modal {
+  width: min(1000px, calc(100vw - 32px));
+  max-height: calc(100vh - 48px);
+  overflow: auto;
+  padding: 16px;
+  border-radius: 10px;
+  background: #fff;
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+}
+
+.detail-modal-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.detail-modal-head h2 {
+  margin: 0;
+  font-size: 18px;
+}
+
+button.detail-modal-close {
+  padding: 2px 10px;
+  font-size: 20px;
+  line-height: 1.2;
+  border-radius: 6px;
+}
+
+/* 弹窗顶部总览：所有说话人、时间对齐、1px 最小宽度、悬停放大镜 */
+.detail-overview {
+  position: relative;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  padding: 10px 12px;
+  border: 1px solid #e5e6eb;
+  border-radius: 8px;
+  background: #fafbfc;
+}
+
+.detail-overview-title {
+  margin: 0;
+  font-size: 12px;
+  color: #86909c;
+}
+
+.overview-row {
+  display: grid;
+  grid-template-columns: minmax(140px, auto) minmax(0, 1fr);
+  align-items: center;
+  gap: 12px;
+}
+
+.overview-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 12px;
+  font-family: ui-monospace, "SF Mono", Consolas, monospace;
+  white-space: nowrap;
+  overflow: hidden;
+}
+
+.overview-chip .dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  flex: none;
+}
+
+.overview-chip-time {
+  color: #86909c;
+  font-size: 11px;
+}
+
+.overview-track {
+  position: relative;
+  width: 100%;
+  height: 24px;
+  background: #eceff2;
+  border-radius: 4px;
+  overflow: hidden;
+}
+
+.overview-track-canvas {
+  position: relative;
+  height: 24px;
+  width: 100%;
+}
+
+.overview-seg-wrap {
+  position: absolute;
+  top: 3px;
+  bottom: 3px;
+  min-width: 1px;
+}
+
+.overview-seg {
+  position: absolute;
+  left: 0;
+  right: 0;
+  top: 0;
+  bottom: 0;
+  min-width: 0;
+  padding: 0;
+  border: none;
+  border-radius: 3px;
+  cursor: pointer;
+  opacity: 0.9;
+}
+
+.overview-seg:hover {
+  opacity: 1;
+  filter: brightness(1.12);
+}
+
+.overview-seg.playing {
+  opacity: 1;
+  outline: 2px solid #1f2329;
+  outline-offset: 1px;
+}
+
+.overview-seg.selected {
+  opacity: 1;
+  outline: 2px solid #1f2329;
+  outline-offset: 1px;
+}
+
+.overview-axis {
+  display: grid;
+  grid-template-columns: minmax(140px, auto) minmax(0, 1fr);
+  gap: 12px;
+  font-size: 11px;
+  color: #86909c;
+}
+
+.overview-axis-canvas {
+  display: flex;
+  justify-content: space-between;
+}
+
+/* 固定 8 秒放大镜：只出现在弹窗顶部总览内，跟随悬停位置浮动 */
+.magnifier {
+  position: absolute;
+  top: 6px;
+  z-index: 5;
+  width: 360px;
+  max-width: calc(100% - 8px);
+  padding: 8px;
+  border: 1px solid #d4d7dd;
+  border-radius: 8px;
+  background: #fff;
+  box-shadow: 0 6px 20px rgb(31 35 41 / 22%);
+  pointer-events: none;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.magnifier-label {
+  display: flex;
+  justify-content: space-between;
+  font-size: 11px;
+  font-family: ui-monospace, "SF Mono", Consolas, monospace;
+  color: #4b5960;
+}
+
+.magnifier-center-time {
+  color: #1f2329;
+  font-weight: 600;
+}
+
+.magnifier-canvas {
+  position: relative;
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  padding: 6px;
+  background: #f0f2f5;
+  border-radius: 6px;
+}
+
+.magnifier-lane {
+  position: relative;
+  height: 10px;
+  background: #e2e6ea;
+  border-radius: 2px;
+}
+
+.magnifier-seg {
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  min-width: 1px;
+  border-radius: 1px;
+  opacity: 0.92;
+}
+
+.magnifier-center {
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  width: 1px;
+  background: #1f2329;
+  opacity: 0.45;
+}
+
+/* 选中时段操作面板占位 */
+.operation-panel {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  padding: 12px 14px;
+  border: 1px solid #e5e6eb;
+  border-radius: 8px;
+  background: #f7f8fa;
+}
+
+.operation-panel-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 14px;
+}
+
+.operation-panel-head .dot {
+  width: 10px;
+  height: 10px;
+  border-radius: 50%;
+  flex: none;
+}
+
+.operation-panel-meta {
+  font-size: 13px;
+  color: #86909c;
+  font-family: ui-monospace, "SF Mono", Consolas, monospace;
+}
+
+.operation-panel-playing {
+  margin-left: auto;
+  font-size: 12px;
+  color: #2ba24c;
+}
+
+.operation-panel-hint {
+  margin: 0;
+  font-size: 13px;
+  color: #86909c;
+}
+
+.operation-panel-actions {
+  display: flex;
+  gap: 8px;
 }

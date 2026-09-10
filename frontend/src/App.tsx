@@ -3,8 +3,7 @@ import {
   useEffect,
   useRef,
   useState,
-  type CSSProperties,
-  type PointerEvent as ReactPointerEvent,
+  type MouseEvent as ReactMouseEvent,
 } from "react";
 
 interface Stage {
@@ -26,14 +25,6 @@ interface TimelineSegment {
   start: number;
   end: number;
   index: number;
-}
-
-type BoundarySide = "start" | "end";
-
-interface BoundaryDrag {
-  segment: TimelineSegment;
-  side: BoundarySide;
-  time: number;
 }
 
 interface CorrectionStatus {
@@ -94,8 +85,9 @@ const SPEAKER_COLORS = [
   "#e8a13a", "#2ab5b5", "#d45791", "#7a8699",
 ];
 
-// 最短段的最小可视宽度；当最短段正好是 1 秒时，1 秒宽度就是 1px。
-const MIN_SECOND_PX = 1;
+// 总览中时段的最小可视宽度：短时段至少 1px，便于发现；大量短时段超过
+// 轨道容量时允许相邻时段视觉覆盖，不再靠横向滚动或整片放大来显示。
+const MIN_SEG_PX = 1;
 
 function speakerColor(speakers: TimelineSpeaker[], label: string): string {
   const i = speakers.findIndex((s) => s.label === label);
@@ -107,6 +99,25 @@ function fmtTime(t: number): string {
   const m = Math.floor(t / 60);
   const s = Math.round(t % 60);
   return `${m}:${String(s).padStart(2, "0")}`;
+}
+
+function shownName(names: Record<string, string>, sp: TimelineSpeaker): string {
+  return names[sp.label] ?? sp.name ?? sp.label;
+}
+
+function isSegmentActive(
+  taskId: string,
+  playing: Playing | null,
+  speaker: string,
+  seg: Pick<TimelineSegment, "start" | "end">,
+): boolean {
+  return (
+    playing !== null &&
+    playing.taskId === taskId &&
+    playing.speaker === speaker &&
+    playing.start === seg.start &&
+    playing.end === seg.end
+  );
 }
 
 interface Task {
@@ -321,40 +332,6 @@ export default function App() {
           setCorrectionError((prev) => ({
             ...prev,
             [task.id]: payload?.detail ?? "改派说话人失败",
-          }));
-          return false;
-        }
-        applyTimeline({
-          taskId: task.id,
-          workspaceKey: workspaceKey(task),
-          timeline: payload,
-        });
-        return true;
-      } catch {
-        setCorrectionError((prev) => ({ ...prev, [task.id]: "无法连接后端服务" }));
-        return false;
-      }
-    },
-    [applyTimeline],
-  );
-
-  const moveSegmentBoundary = useCallback(
-    async (task: Task, segment: TimelineSegment, side: BoundarySide, time: number) => {
-      setCorrectionError((prev) => ({ ...prev, [task.id]: null }));
-      try {
-        const resp = await fetch(
-          `/api/tasks/${task.id}/segments/${segment.index}/boundary`,
-          {
-            method: "PUT",
-            headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({ side, new_time: time }),
-          },
-        );
-        const payload = await resp.json().catch(() => null);
-        if (!resp.ok) {
-          setCorrectionError((prev) => ({
-            ...prev,
-            [task.id]: payload?.detail ?? "调整时段边界失败",
           }));
           return false;
         }
@@ -787,7 +764,6 @@ export default function App() {
           onStoreVoiceprint={(label) => handleStoreVoiceprint(t, label)}
           voiceprintBusy={(rowLabel) => Boolean(voiceprintBusy[`${t.id}:${rowLabel}`])}
           onReassign={(segment, target) => reassignSegment(t, segment, target)}
-          onBoundary={(segment, side, time) => moveSegmentBoundary(t, segment, side, time)}
           onDiscard={() => discardCorrections(t)}
           correctionError={correctionError[t.id] ?? null}
         />
@@ -1315,7 +1291,6 @@ function SpeakerTimeline({
   onStoreVoiceprint,
   voiceprintBusy,
   onReassign,
-  onBoundary,
   onDiscard,
   correctionError,
 }: {
@@ -1334,136 +1309,19 @@ function SpeakerTimeline({
   onStoreVoiceprint: (label: string) => Promise<void>;
   voiceprintBusy: (label: string) => boolean;
   onReassign: (segment: TimelineSegment, target: string) => Promise<boolean>;
-  onBoundary: (
-    segment: TimelineSegment,
-    side: BoundarySide,
-    time: number,
-  ) => Promise<boolean>;
   onDiscard: () => Promise<void>;
   correctionError: string | null;
 }) {
-  const [reassigning, setReassigning] = useState<TimelineSegment | null>(null);
-  const [target, setTarget] = useState("__new__");
-  const [saving, setSaving] = useState(false);
-  const [dragging, setDragging] = useState<BoundaryDrag | null>(null);
+  const [detail, setDetail] = useState<{
+    speaker: string;
+    segment: TimelineSegment;
+  } | null>(null);
   const correction = timeline.correction;
-  const pct = (v: number) => `${((v / timeline.duration) * 100).toFixed(3)}%`;
-  const shown = (sp: TimelineSpeaker) => names[sp.label] ?? sp.name ?? sp.label;
-  const isActive = (sp: TimelineSpeaker, seg: Pick<TimelineSegment, "start" | "end">) =>
-    playing !== null &&
-    playing.taskId === taskId &&
-    playing.speaker === sp.label &&
-    playing.start === seg.start &&
-    playing.end === seg.end;
-
-  const allSegments = timeline.speakers.flatMap((sp) => sp.segments);
-  const shortestSegment = allSegments.reduce<number | null>((shortest, seg) => {
-    const duration = seg.end - seg.start;
-    return duration > 0 && (shortest === null || duration < shortest)
-      ? duration
-      : shortest;
-  }, null);
-  const pxPerSecond = shortestSegment
-    ? Math.max(MIN_SECOND_PX, MIN_SECOND_PX / shortestSegment)
-    : MIN_SECOND_PX;
-  const timelineTrackWidth = timeline.duration > 0
-    ? `${(timeline.duration * pxPerSecond).toFixed(3)}px`
-    : "0px";
-  const shownTimeline = (() => {
-    if (dragging === null || !correction.editable) return timeline;
-    const { segment, side, time } = dragging;
-    const sharedNeighbor = allSegments.find(
-      (other) =>
-        other.index !== segment.index &&
-        Math.abs(
-          (side === "end" ? other.start : other.end) -
-            (side === "end" ? segment.end : segment.start),
-        ) < 0.0005,
-    );
-    let min = side === "end" ? segment.start + 0.001 : 0;
-    let max = side === "end" ? timeline.duration : segment.end - 0.001;
-    if (sharedNeighbor) {
-      if (side === "end") {
-        max = Math.min(max, sharedNeighbor.end - 0.001);
-      } else {
-        min = Math.max(min, sharedNeighbor.start + 0.001);
-      }
-    } else {
-      const neighbor = allSegments.find(
-        (other) =>
-          other.index !== segment.index &&
-          (side === "end" ? other.start >= segment.end : other.end <= segment.start),
-      );
-      if (neighbor) {
-        if (side === "end") max = Math.min(max, neighbor.start);
-        else min = Math.max(min, neighbor.end);
-      }
-    }
-    const boundary = Math.min(max, Math.max(min, time));
-    const updates = new Map<number, TimelineSegment>([
-      [
-        segment.index,
-        side === "end" ? { ...segment, end: boundary } : { ...segment, start: boundary },
-      ],
-    ]);
-    if (sharedNeighbor) {
-      updates.set(
-        sharedNeighbor.index,
-        side === "end"
-          ? { ...sharedNeighbor, start: boundary }
-          : { ...sharedNeighbor, end: boundary },
-      );
-    }
-    return {
-      ...timeline,
-      speakers: timeline.speakers.map((sp) => ({
-        ...sp,
-        segments: sp.segments.map((seg) => updates.get(seg.index) ?? seg),
-      })),
-    };
-  })();
-
-  function startBoundaryDrag(
-    event: ReactPointerEvent<HTMLDivElement>,
-    segment: TimelineSegment,
-    side: BoundarySide,
-  ) {
-    if (!correction.editable || timeline.duration <= 0) return;
-    event.preventDefault();
-    event.stopPropagation();
-    event.currentTarget.setPointerCapture(event.pointerId);
-    setDragging({
-      segment,
-      side,
-      time: side === "end" ? segment.end : segment.start,
-    });
-  }
-
-  function moveBoundaryDrag(event: ReactPointerEvent<HTMLDivElement>) {
-    if (dragging === null) return;
-    const track = event.currentTarget.closest<HTMLElement>(".timeline-track");
-    const canvas = track?.querySelector<HTMLElement>(".timeline-track-canvas");
-    if (!canvas || timeline.duration <= 0) return;
-    const rect = canvas.getBoundingClientRect();
-    if (rect.width <= 0) return;
-    const time = ((event.clientX - rect.left) / rect.width) * timeline.duration;
-    setDragging((prev) =>
-      prev ? { ...prev, time: Math.min(timeline.duration, Math.max(0, time)) } : prev,
-    );
-  }
-
-  function finishBoundaryDrag(commit: boolean) {
-    const request = dragging;
-    setDragging(null);
-    if (commit && request && correction.editable) {
-      void onBoundary(request.segment, request.side, request.time);
-    }
-  }
 
   return (
     <div className="timeline">
       <div className="timeline-title">
-        说话人时间轴（共 {timeline.num_speakers} 人，点击名字可命名，点击任意时段试听，拖拽边缘可调整边界）
+        说话人时间轴总览（共 {timeline.num_speakers} 人，点击时段打开校正详情；点击名字可命名）
       </div>
       {samplesHint && <p className="timeline-hint">{samplesHint}</p>}
       {correction.message && <p className="correction-warning">{correction.message}</p>}
@@ -1475,207 +1333,483 @@ function SpeakerTimeline({
           <button
             type="button"
             onClick={() => onDiscard()}
-            disabled={
-              saving ||
-              (correction.state !== "invalidated" && !correction.editable)
-            }
+            disabled={correction.state !== "invalidated" && !correction.editable}
           >
             {correction.state === "invalidated" ? "放弃作废校正" : "放弃全部校正"}
           </button>
         </div>
       )}
       {correctionError && <p className="error-text">{correctionError}</p>}
-      <div className="timeline-body">
-        <div
-          className="timeline-canvas"
-          style={{ "--timeline-track-width": timelineTrackWidth } as CSSProperties}
-        >
-          {shownTimeline.speakers.map((sp) => {
-            const color = speakerColor(timeline.speakers, sp.label);
-            const samples = samplesBySpeaker[sp.label] ?? [];
-            return (
-              <div key={sp.label} className="timeline-row">
-                <span className="speaker-chip">
-                  <span className="dot" style={{ background: color }} />
-                  <SpeakerName
-                    label={sp.label}
-                    name={names[sp.label] ?? sp.name ?? null}
-                    auto={Boolean(sp.auto && !names[sp.label])}
-                    editable={correction.editable}
-                    onRename={onRename}
-                  />
-                  <span className="speech-time">{fmtTime(sp.speech_time)}</span>
-                  <button
-                    type="button"
-                    className="store-voiceprint"
-                    disabled={voiceprintBusy(sp.label)}
-                    title={`从 ${shown(sp)} 的当前生效时段抽取声纹并存入声纹库`}
-                    onClick={() => void onStoreVoiceprint(sp.label)}
-                  >
-                    {voiceprintBusy(sp.label) ? "存入中…" : "存入声纹库"}
-                  </button>
-                </span>
-                <div className="timeline-track">
-                  <div className="timeline-track-canvas">
-                    {sp.segments.map((seg) => (
-                      <div
-                        key={seg.index}
-                        className="timeline-seg-wrap"
-                        style={{
-                          left: pct(seg.start),
-                          width: pct(seg.end - seg.start),
-                        }}
+      <div className="timeline-canvas">
+        {timeline.speakers.map((sp) => {
+          const color = speakerColor(timeline.speakers, sp.label);
+          const samples = samplesBySpeaker[sp.label] ?? [];
+          return (
+            <div key={sp.label} className="timeline-row">
+              <span className="speaker-chip">
+                <span className="dot" style={{ background: color }} />
+                <SpeakerName
+                  label={sp.label}
+                  name={names[sp.label] ?? sp.name ?? null}
+                  auto={Boolean(sp.auto && !names[sp.label])}
+                  editable={correction.editable}
+                  onRename={onRename}
+                />
+                <span className="speech-time">{fmtTime(sp.speech_time)}</span>
+                <button
+                  type="button"
+                  className="store-voiceprint"
+                  disabled={voiceprintBusy(sp.label)}
+                  title={`从 ${shownName(names, sp)} 的当前生效时段抽取声纹并存入声纹库`}
+                  onClick={() => void onStoreVoiceprint(sp.label)}
+                >
+                  {voiceprintBusy(sp.label) ? "存入中…" : "存入声纹库"}
+                </button>
+              </span>
+              <SegmentTrack
+                taskId={taskId}
+                duration={timeline.duration}
+                speaker={sp}
+                color={color}
+                playing={playing}
+                selectedKey={null}
+                onSelect={(speakerLabel, seg) => setDetail({ speaker: speakerLabel, segment: seg })}
+                variant="main"
+              />
+              {samples.length > 0 && (
+                <div className="speaker-samples">
+                  <span className="samples-label">样本台词</span>
+                  <div className="sample-list">
+                    {samples.map((s, i) => (
+                      <button
+                        key={i}
+                        type="button"
+                        className={`sample${
+                          isSegmentActive(taskId, playing, sp.label, s) ? " playing" : ""
+                        }`}
+                        title={`试听 ${shownName(names, sp)} 的样本 ${fmtTime(s.start)} – ${fmtTime(s.end)}`}
+                        onClick={() => onPlay(taskId, sp.label, s)}
                       >
-                        {correction.editable &&
-                          !allSegments.some(
-                            (other) =>
-                              other.index !== seg.index &&
-                              Math.abs(other.end - seg.start) < 0.0005,
-                          ) && (
-                            <div
-                              className="timeline-edge start"
-                              title={`拖拽 ${shown(sp)} 的开始边界`}
-                              role="separator"
-                              aria-orientation="vertical"
-                              onPointerDown={(event) => startBoundaryDrag(event, seg, "start")}
-                              onPointerMove={moveBoundaryDrag}
-                              onPointerUp={() => finishBoundaryDrag(true)}
-                              onPointerCancel={() => finishBoundaryDrag(false)}
-                            />
-                          )}
-                        <button
-                          type="button"
-                          className={`timeline-seg${isActive(sp, seg) ? " playing" : ""}`}
-                          style={{ background: color }}
-                          title={`${shown(sp)} · ${fmtTime(seg.start)} – ${fmtTime(seg.end)}`}
-                          aria-label={`试听 ${shown(sp)}，${fmtTime(seg.start)} 到 ${fmtTime(seg.end)}`}
-                          onClick={() => onPlay(taskId, sp.label, seg)}
-                        />
-                        {correction.editable &&
-                          !allSegments.some(
-                            (other) =>
-                              other.index !== seg.index &&
-                              Math.abs(other.start - seg.end) < 0.0005,
-                          ) && (
-                            <div
-                              className="timeline-edge end"
-                              title={`拖拽 ${shown(sp)} 的结束边界`}
-                              role="separator"
-                              aria-orientation="vertical"
-                              onPointerDown={(event) => startBoundaryDrag(event, seg, "end")}
-                              onPointerMove={moveBoundaryDrag}
-                              onPointerUp={() => finishBoundaryDrag(true)}
-                              onPointerCancel={() => finishBoundaryDrag(false)}
-                            />
-                          )}
-                        <button
-                          type="button"
-                          className="timeline-seg-edit"
-                          disabled={!correction.editable}
-                          title={`改派 ${fmtTime(seg.start)} – ${fmtTime(seg.end)} 的说话人`}
-                          aria-label={`改派 ${fmtTime(seg.start)} 到 ${fmtTime(seg.end)} 的说话人时段`}
-                          onClick={() => {
-                            setTarget("__new__");
-                            setReassigning(seg);
-                          }}
-                        >
-                          改
-                        </button>
-                      </div>
+                        <span className="sample-time">
+                          {fmtTime(s.start)}–{fmtTime(s.end)}
+                        </span>
+                        <span className="sample-text">
+                          {s.text || "（无可识别台词）"}
+                        </span>
+                      </button>
                     ))}
                   </div>
                 </div>
-                {samples.length > 0 && (
-                  <div className="speaker-samples">
-                    <span className="samples-label">样本台词</span>
-                    <div className="sample-list">
-                      {samples.map((s, i) => (
-                        <button
-                          key={i}
-                          type="button"
-                          className={`sample${isActive(sp, s) ? " playing" : ""}`}
-                          title={`试听 ${shown(sp)} 的样本 ${fmtTime(s.start)} – ${fmtTime(s.end)}`}
-                          onClick={() => onPlay(taskId, sp.label, s)}
-                        >
-                          <span className="sample-time">
-                            {fmtTime(s.start)}–{fmtTime(s.end)}
-                          </span>
-                          <span className="sample-text">
-                            {s.text || "（无可识别台词）"}
-                          </span>
-                        </button>
-                      ))}
-                    </div>
-                  </div>
-                )}
+              )}
+            </div>
+          );
+        })}
+        {timeline.duration > 0 && (
+          <div className="timeline-axis">
+            <span />
+            <div className="timeline-axis-canvas">
+              {Array.from({ length: 5 }, (_, i) => (
+                <span key={i}>{fmtTime((timeline.duration * i) / 4)}</span>
+              ))}
+            </div>
+          </div>
+        )}
+      </div>
+      {detail && (
+        <DetailModal
+          taskId={taskId}
+          timeline={timeline}
+          names={names}
+          playing={playing}
+          editable={correction.editable}
+          onPlay={onPlay}
+          onReassign={onReassign}
+          initial={detail}
+          onClose={() => setDetail(null)}
+        />
+      )}
+    </div>
+  );
+}
+
+// 总览轨道中的单个说话人时段绘制：整片时长映射到可用轨道宽度，短时段保留
+// 1px 最小可视宽度，超过容量时允许相邻时段视觉覆盖。主界面与详情弹窗顶部
+// 总览共用同一套绘制，只是样式类名不同。
+function SegmentTrack({
+  taskId,
+  duration,
+  speaker,
+  color,
+  playing,
+  selectedKey,
+  onSelect,
+  variant,
+}: {
+  taskId: string;
+  duration: number;
+  speaker: TimelineSpeaker;
+  color: string;
+  playing: Playing | null;
+  selectedKey: string | null;
+  onSelect?: (speakerLabel: string, seg: TimelineSegment) => void;
+  variant: "main" | "overview";
+}) {
+  const pct = (v: number) => `${((v / duration) * 100).toFixed(3)}%`;
+  const classes =
+    variant === "main"
+      ? {
+          track: "timeline-track",
+          canvas: "timeline-track-canvas",
+          wrap: "timeline-seg-wrap",
+          seg: "timeline-seg",
+        }
+      : {
+          track: "overview-track",
+          canvas: "overview-track-canvas",
+          wrap: "overview-seg-wrap",
+          seg: "overview-seg",
+        };
+  return (
+    <div className={classes.track}>
+      <div className={classes.canvas}>
+        {speaker.segments.map((seg) => {
+          const active = isSegmentActive(taskId, playing, speaker.label, seg);
+          const selected = selectedKey === `${speaker.label}:${seg.index}`;
+          return (
+            <div
+              key={seg.index}
+              className={classes.wrap}
+              style={{
+                left: pct(seg.start),
+                width: pct(seg.end - seg.start),
+                minWidth: MIN_SEG_PX,
+              }}
+            >
+              <button
+                type="button"
+                className={`${classes.seg}${active ? " playing" : ""}${selected ? " selected" : ""}`}
+                style={{ background: color }}
+                title={`${speaker.label} · ${fmtTime(seg.start)} – ${fmtTime(seg.end)}`}
+                aria-label={`${speaker.label}，${fmtTime(seg.start)} 到 ${fmtTime(seg.end)}`}
+                disabled={!onSelect}
+                onClick={onSelect ? () => onSelect(speaker.label, seg) : undefined}
+              />
+            </div>
+          );
+        })}
+      </div>
+    </div>
+  );
+}
+
+// 校正详情弹窗：约 1000px 宽。顶部是全片总览（所有说话人、时间对齐、1px 最小
+// 宽度、悬停显示固定 8 秒放大镜），点击总览中的时段选中它；下方是选中时段的
+// 操作面板占位（试听与改派可用，切分等精细操作由后续版本提供）。
+function DetailModal({
+  taskId,
+  timeline,
+  names,
+  playing,
+  editable,
+  onPlay,
+  onReassign,
+  initial,
+  onClose,
+}: {
+  taskId: string;
+  timeline: Timeline;
+  names: Record<string, string>;
+  playing: Playing | null;
+  editable: boolean;
+  onPlay: (
+    taskId: string,
+    speaker: string,
+    seg: Pick<TimelineSegment, "start" | "end">,
+  ) => void;
+  onReassign: (segment: TimelineSegment, target: string) => Promise<boolean>;
+  initial: { speaker: string; segment: TimelineSegment };
+  onClose: () => void;
+}) {
+  const [selected, setSelected] = useState(initial);
+  const [hoverTime, setHoverTime] = useState<number | null>(null);
+  const [hoverX, setHoverX] = useState(0);
+  const [overviewWidth, setOverviewWidth] = useState(0);
+  const [reassigning, setReassigning] = useState<TimelineSegment | null>(null);
+  const [saving, setSaving] = useState(false);
+  const overviewRef = useRef<HTMLDivElement | null>(null);
+
+  const duration = timeline.duration;
+  const selectedSpeaker = timeline.speakers.find(
+    (sp) => sp.label === selected.speaker,
+  );
+  const selectedColor = selectedSpeaker
+    ? speakerColor(timeline.speakers, selectedSpeaker.label)
+    : "#7a8699";
+
+  // 固定 8 秒放大镜窗口：以悬停时间为中心，靠近片头/片尾时整体平移保持 8 秒。
+  const MAGNIFIER_SECONDS = 8;
+  const windowStart =
+    duration > 0 && hoverTime !== null
+      ? Math.min(
+          Math.max(hoverTime - MAGNIFIER_SECONDS / 2, 0),
+          Math.max(0, duration - MAGNIFIER_SECONDS),
+        )
+      : 0;
+  const windowEnd =
+    duration > 0 && hoverTime !== null
+      ? Math.min(duration, windowStart + MAGNIFIER_SECONDS)
+      : 0;
+  const windowSeconds = Math.max(0, windowEnd - windowStart);
+  const inWindow = (seg: TimelineSegment) =>
+    seg.end > windowStart && seg.start < windowEnd;
+  const windowLeft = (seg: TimelineSegment) =>
+    Math.max(0, ((seg.start - windowStart) / windowSeconds) * 100);
+  const windowRight = (seg: TimelineSegment) =>
+    Math.min(100, ((seg.end - windowStart) / windowSeconds) * 100);
+  const centerPct =
+    windowSeconds > 0 && hoverTime !== null
+      ? Math.min(100, Math.max(0, ((hoverTime - windowStart) / windowSeconds) * 100))
+      : 50;
+
+  function handleOverviewMove(event: ReactMouseEvent<HTMLDivElement>) {
+    if (duration <= 0) return;
+    const el = overviewRef.current;
+    if (!el) return;
+    const rect = el.getBoundingClientRect();
+    if (rect.width <= 0) return;
+    const x = Math.min(Math.max(event.clientX - rect.left, 0), rect.width);
+    setHoverX(x);
+    setOverviewWidth(rect.width);
+    setHoverTime(Math.min(duration, (x / rect.width) * duration));
+  }
+
+  useEffect(() => {
+    function onKeyDown(event: KeyboardEvent) {
+      if (event.key === "Escape") onClose();
+    }
+    window.addEventListener("keydown", onKeyDown);
+    return () => window.removeEventListener("keydown", onKeyDown);
+  }, [onClose]);
+
+  const magnifierWidth = 360;
+  const magnifierLeft =
+    overviewWidth > magnifierWidth
+      ? Math.min(Math.max(hoverX - magnifierWidth / 2, 0), overviewWidth - magnifierWidth)
+      : 0;
+
+  return (
+    <div
+      className="detail-modal-backdrop"
+      role="presentation"
+      onMouseDown={onClose}
+    >
+      <div
+        className="detail-modal"
+        role="dialog"
+        aria-modal="true"
+        onClick={(e) => e.stopPropagation()}
+        onMouseDown={(e) => e.stopPropagation()}
+      >
+        <div className="detail-modal-head">
+          <h2>说话人时段校正</h2>
+          <button
+            type="button"
+            className="detail-modal-close"
+            aria-label="关闭"
+            onClick={onClose}
+          >
+            ×
+          </button>
+        </div>
+        <div
+          className="detail-overview"
+          ref={overviewRef}
+          onMouseMove={handleOverviewMove}
+          onMouseLeave={() => setHoverTime(null)}
+        >
+          <p className="detail-overview-title">
+            全片总览（点击时段选中；悬停显示固定 8 秒放大镜）
+          </p>
+          {timeline.speakers.map((sp) => {
+            const color = speakerColor(timeline.speakers, sp.label);
+            return (
+              <div key={sp.label} className="overview-row">
+                <span className="overview-chip">
+                  <span className="dot" style={{ background: color }} />
+                  {shownName(names, sp)}
+                  <span className="overview-chip-time">{fmtTime(sp.speech_time)}</span>
+                </span>
+                <SegmentTrack
+                  taskId={taskId}
+                  duration={duration}
+                  speaker={sp}
+                  color={color}
+                  playing={playing}
+                  selectedKey={`${selected.speaker}:${selected.segment.index}`}
+                  onSelect={(speakerLabel, seg) =>
+                    setSelected({ speaker: speakerLabel, segment: seg })
+                  }
+                  variant="overview"
+                />
               </div>
             );
           })}
-          {timeline.duration > 0 && (
-            <div className="timeline-axis">
+          {duration > 0 && (
+            <div className="overview-axis">
               <span />
-              <div className="timeline-axis-scroll">
-                <div className="timeline-axis-canvas">
-                  {Array.from({ length: 5 }, (_, i) => (
-                    <span key={i}>{fmtTime((timeline.duration * i) / 4)}</span>
-                  ))}
-                </div>
+              <div className="overview-axis-canvas">
+                {Array.from({ length: 5 }, (_, i) => (
+                  <span key={i}>{fmtTime((duration * i) / 4)}</span>
+                ))}
               </div>
             </div>
           )}
-        </div>
-      </div>
-      {reassigning && (
-        <div
-          className="correction-dialog-backdrop"
-          role="presentation"
-          onClick={() => setReassigning(null)}
-        >
-          <div
-            className="correction-dialog"
-            role="dialog"
-            aria-modal="true"
-            onClick={(e) => e.stopPropagation()}
-          >
-            <h3>改派说话人时段</h3>
-            <p className="correction-dialog-meta">
-              {fmtTime(reassigning.start)} – {fmtTime(reassigning.end)}
-            </p>
-            <label>
-              新说话人
-              <select
-                value={target}
-                onChange={(e) => setTarget(e.target.value)}
-              >
-                <option value="__new__">新建说话人（顺延编号）</option>
-                {timeline.speakers.map((sp) => (
-                  <option key={sp.label} value={sp.label}>
-                    {shown(sp)}
-                  </option>
-                ))}
-              </select>
-            </label>
-            <div className="correction-dialog-actions">
-              <button type="button" onClick={() => setReassigning(null)}>
-                取消
-              </button>
-              <button
-                type="button"
-                className="primary"
-                disabled={saving}
-                onClick={async () => {
-                  setSaving(true);
-                  const ok = await onReassign(reassigning, target);
-                  setSaving(false);
-                  if (ok) setReassigning(null);
-                }}
-              >
-                {saving ? "保存中…" : "保存改派"}
-              </button>
+          {hoverTime !== null && windowSeconds > 0 && (
+            <div className="magnifier" style={{ left: magnifierLeft }}>
+              <div className="magnifier-label">
+                <span>{fmtTime(windowStart)} – {fmtTime(windowEnd)}</span>
+                <span className="magnifier-center-time">{fmtTime(hoverTime)}</span>
+              </div>
+              <div className="magnifier-canvas">
+                {timeline.speakers.map((sp) => {
+                  const color = speakerColor(timeline.speakers, sp.label);
+                  return (
+                    <div key={sp.label} className="magnifier-lane">
+                      {sp.segments.filter(inWindow).map((seg) => (
+                        <div
+                          key={seg.index}
+                          className="magnifier-seg"
+                          style={{
+                            left: `${windowLeft(seg).toFixed(3)}%`,
+                            width: `${Math.max(0, windowRight(seg) - windowLeft(seg)).toFixed(3)}%`,
+                            background: color,
+                          }}
+                        />
+                      ))}
+                    </div>
+                  );
+                })}
+              </div>
+              <div
+                className="magnifier-center"
+                style={{ left: `${centerPct.toFixed(3)}%` }}
+              />
             </div>
+          )}
+        </div>
+        <div className="operation-panel">
+          <div className="operation-panel-head">
+            <span className="dot" style={{ background: selectedColor }} />
+            <strong>{selectedSpeaker ? shownName(names, selectedSpeaker) : selected.speaker}</strong>
+            <span className="operation-panel-meta">
+              {fmtTime(selected.segment.start)} – {fmtTime(selected.segment.end)}
+            </span>
+            {isSegmentActive(taskId, playing, selected.speaker, selected.segment) && (
+              <span className="operation-panel-playing">试听中</span>
+            )}
+          </div>
+          <p className="operation-panel-hint">
+            操作面板占位：试听与改派可用，切分等精细校正将在后续提供。
+          </p>
+          <div className="operation-panel-actions">
+            <button
+              type="button"
+              onClick={() => onPlay(taskId, selected.speaker, selected.segment)}
+            >
+              试听选中时段
+            </button>
+            <button
+              type="button"
+              disabled={!editable}
+              title={
+                editable
+                  ? `改派 ${fmtTime(selected.segment.start)} – ${fmtTime(selected.segment.end)} 的说话人`
+                  : "任务运行中或校正已锁定"
+              }
+              onClick={() => setReassigning(selected.segment)}
+            >
+              改派说话人
+            </button>
           </div>
         </div>
-      )}
+        {reassigning && (
+          <ReassignDialog
+            segment={reassigning}
+            timeline={timeline}
+            names={names}
+            saving={saving}
+            onCancel={() => setReassigning(null)}
+            onSave={async (target) => {
+              setSaving(true);
+              const ok = await onReassign(reassigning, target);
+              setSaving(false);
+              if (ok) setReassigning(null);
+            }}
+          />
+        )}
+      </div>
+    </div>
+  );
+}
+
+// 改派说话人时段的确认弹窗（在详情弹窗内复用原校正对话框样式）。
+function ReassignDialog({
+  segment,
+  timeline,
+  names,
+  saving,
+  onCancel,
+  onSave,
+}: {
+  segment: TimelineSegment;
+  timeline: Timeline;
+  names: Record<string, string>;
+  saving: boolean;
+  onCancel: () => void;
+  onSave: (target: string) => void;
+}) {
+  const [target, setTarget] = useState("__new__");
+  return (
+    <div
+      className="correction-dialog-backdrop"
+      role="presentation"
+      onClick={onCancel}
+    >
+      <div
+        className="correction-dialog"
+        role="dialog"
+        aria-modal="true"
+        onClick={(e) => e.stopPropagation()}
+      >
+        <h3>改派说话人时段</h3>
+        <p className="correction-dialog-meta">
+          {fmtTime(segment.start)} – {fmtTime(segment.end)}
+        </p>
+        <label>
+          新说话人
+          <select value={target} onChange={(e) => setTarget(e.target.value)}>
+            <option value="__new__">新建说话人（顺延编号）</option>
+            {timeline.speakers.map((sp) => (
+              <option key={sp.label} value={sp.label}>
+                {shownName(names, sp)}
+              </option>
+            ))}
+          </select>
+        </label>
+        <div className="correction-dialog-actions">
+          <button type="button" onClick={onCancel}>
+            取消
+          </button>
+          <button
+            type="button"
+            className="primary"
+            disabled={saving}
+            onClick={() => onSave(target)}
+          >
+            {saving ? "保存中…" : "保存改派"}
+          </button>
+        </div>
+      </div>
     </div>
   );
 }
