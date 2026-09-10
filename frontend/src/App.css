@@ -1088,3 +1088,111 @@ button.detail-modal-close {
   display: flex;
   gap: 8px;
 }
+
+/* 选中时段切分面板：拉宽时间轴 + 间隔线添加/拖动/删除 + 结果区间分配 */
+.split-track {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  margin-top: 2px;
+}
+
+.split-track-canvas {
+  position: relative;
+  width: 100%;
+  height: 44px;
+  background: #eceff2;
+  border-radius: 6px;
+  cursor: crosshair;
+  user-select: none;
+  touch-action: none;
+}
+
+.split-interval {
+  position: absolute;
+  top: 6px;
+  bottom: 6px;
+  border-radius: 4px;
+  opacity: 0.85;
+}
+
+.split-marker {
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  width: 14px;
+  transform: translateX(-50%);
+  cursor: ew-resize;
+  z-index: 2;
+}
+
+.split-marker-line {
+  position: absolute;
+  top: 4px;
+  bottom: 4px;
+  left: 50%;
+  width: 2px;
+  transform: translateX(-50%);
+  background: #1f2329;
+  border-radius: 1px;
+}
+
+.split-marker-delete {
+  position: absolute;
+  top: -26px;
+  left: 50%;
+  transform: translateX(-50%);
+  width: 20px;
+  height: 20px;
+  padding: 0;
+  line-height: 1;
+  font-size: 14px;
+  border-radius: 50%;
+  background: #e0533d;
+  color: #fff;
+  border: none;
+  cursor: pointer;
+  box-shadow: 0 2px 6px rgb(31 35 41 / 30%);
+  z-index: 3;
+}
+
+.split-axis {
+  display: flex;
+  justify-content: space-between;
+  font-size: 11px;
+  color: #86909c;
+  font-family: ui-monospace, "SF Mono", Consolas, monospace;
+}
+
+.split-intervals {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.split-intervals-title {
+  font-size: 12px;
+  color: #4b5960;
+}
+
+.split-interval-row {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+}
+
+.split-interval-time {
+  min-width: 130px;
+  font-size: 12px;
+  font-family: ui-monospace, "SF Mono", Consolas, monospace;
+  color: #1f2329;
+}
+
+.split-interval-row select {
+  min-width: 180px;
+}
+
+.split-panel-actions {
+  display: flex;
+  justify-content: flex-end;
+}

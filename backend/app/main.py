@@ -77,6 +77,19 @@ class BoundaryIn(BaseModel):
     new_time: float = Field(ge=0)
 
 
+class SplitResultIn(BaseModel):
+    # 切分结果区间：start/end 是绝对时间；target 是现有说话人标签或
+    # "__new__"（新建说话人，需配合 slot 槽位标识，同槽位映射同一标签）。
+    start: float = Field(ge=0)
+    end: float = Field(gt=0)
+    target: str = Field(min_length=1)
+    slot: str | None = None
+
+
+class SegmentSplitIn(BaseModel):
+    results: list[SplitResultIn] = Field(min_length=2)
+
+
 
 class SuggestionDecisionIn(BaseModel):
     # ignore 只是裁决标记，不删除建议；accept 才会并入人工校正层。
@@ -592,6 +605,37 @@ def create_app(
         except ValueError as e:
             message = str(e)
             status_code = 400 if message == "该时段已属于目标说话人" else 404
+            raise HTTPException(status_code=status_code, detail=message)
+        return _timeline_payload(task)
+
+    @app.put("/api/tasks/{task_id}/segments/{segment_index}/split")
+    def split_segment(task_id: str, segment_index: int, body: SegmentSplitIn):
+        """人工切分一个生效时段：按连续结果区间一次性替换原时段。
+
+        结果区间必须至少两个、每段至少 0.1 秒、按时间连续且精确覆盖原时段、
+        全部指定说话人、至少一段改变归属；同槽位新建说话人映射同一标签。
+        校验失败不产生部分保存；成功时原子替换并返回刷新后的时间轴。
+        """
+        task = _require_task(manager, task_id)
+        raw = _load_diarization(task)
+        snapshot, state = _correction_snapshot(task, raw)
+        status = _correction_status(
+            task, snapshot, state, manager.workspace_busy(str(task.workspace_dir))
+        )
+        if not status["editable"]:
+            raise HTTPException(status_code=409, detail=status["locked_reason"])
+        try:
+            updated = corrections.apply_segment_split(
+                raw.get("segments", []),
+                snapshot,
+                segment_index,
+                [r.model_dump() for r in body.results],
+                _diarization_fingerprint(raw),
+            )
+            corrections.write_corrections(Path(task.workspace_dir), updated)
+        except ValueError as e:
+            message = str(e)
+            status_code = 404 if message == "说话人时段不存在" else 400
             raise HTTPException(status_code=status_code, detail=message)
         return _timeline_payload(task)
 

@@ -20,6 +20,12 @@ CORRECTIONS_VERSION = 1
 _LABEL_NUMBER = re.compile(r"SPEAKER_(\d+)\Z")
 # 时段最小宽度：拖拽不允许把一个时段夹成零时长，也避免浮点数产生退化区间。
 MIN_SEGMENT_SECONDS = 1e-6
+# 切分结果区间最小宽度（秒）：避免产生难以操作的极碎时段。
+MIN_SPLIT_SECONDS = 0.1
+# 切分结果区间时间比较容差：拖动/换算产生的浮点误差在此范围内视为连续覆盖。
+_SPLIT_TOLERANCE = 1e-6
+# 新建说话人槽位的 API 协议标记；配合 slot 槽位标识把多个区间映射到同一标签。
+_NEW_SLOT_TOKEN = "__new__"
 
 
 
@@ -177,6 +183,115 @@ def apply_reassignment(
         "segments": segments,
         "created_labels": created_labels,
         "revision": revision,
+        "updated_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+    }
+
+
+def _validate_split_results(results) -> list[dict]:
+    """归一化并校验切分结果区间列表；返回按时间排序的规范字典列表。"""
+    if not isinstance(results, list) or not results:
+        raise ValueError("切分结果非法")
+    normalized: list[dict] = []
+    for item in results:
+        if not isinstance(item, dict):
+            raise ValueError("切分结果非法")
+        target = item.get("target")
+        try:
+            start = float(item.get("start"))
+            end = float(item.get("end"))
+        except (TypeError, ValueError) as e:
+            raise ValueError("结果区间时间非法") from e
+        if not isinstance(target, str) or not target:
+            raise ValueError("结果区间必须指定说话人")
+        if not math.isfinite(start) or not math.isfinite(end) or start < 0 or end <= start:
+            raise ValueError("结果区间时间非法")
+        normalized.append(
+            {
+                "start": start,
+                "end": end,
+                "target": target,
+                "slot": str(item.get("slot") or ""),
+            }
+        )
+    normalized.sort(key=lambda item: (item["start"], item["end"]))
+    return normalized
+
+
+def apply_segment_split(
+    base_segments: list[dict],
+    snapshot: dict | None,
+    segment_index: int,
+    results,
+    base_fingerprint: str | None = None,
+) -> dict:
+    """按间隔线把一个生效时段拆成相邻结果区间，返回新的完整时段快照。
+
+    results 是「按时间排序的连续区间」列表，每项含 start/end/target：
+    target 为现有说话人标签，或 "__new__"（此时必须带 slot 槽位标识，
+    同一个 slot 映射为同一个顺延的 SPEAKER_XX 标签）。校验失败抛
+    ValueError；函数是纯函数，调用方负责把返回的快照持久化。
+    """
+    if snapshot_state(base_segments, snapshot, base_fingerprint) != "active":
+        snapshot = None  # 无效快照不继承修订号或历史新建说话人
+    current = _effective_snapshot_segments(base_segments, snapshot, base_fingerprint)
+    if not isinstance(segment_index, int) or not 0 <= segment_index < len(current):
+        raise ValueError("说话人时段不存在")
+    original = current[segment_index]
+
+    normalized = _validate_split_results(results)
+    if len(normalized) < 2:
+        raise ValueError("至少需要两个结果区间")
+
+    tol = _SPLIT_TOLERANCE
+    if abs(normalized[0]["start"] - original["start"]) > tol:
+        raise ValueError("结果区间必须精确覆盖原时段")
+    if abs(normalized[-1]["end"] - original["end"]) > tol:
+        raise ValueError("结果区间必须精确覆盖原时段")
+    for a, b in zip(normalized, normalized[1:]):
+        if b["start"] < a["end"] - tol:
+            raise ValueError("结果区间必须按时间连续且互不重叠")
+        if b["start"] > a["end"] + tol:
+            raise ValueError("结果区间必须按时间连续且精确覆盖原时段")
+    for item in normalized:
+        if item["end"] - item["start"] + tol < MIN_SPLIT_SECONDS:
+            raise ValueError("每个结果区间至少 0.1 秒")
+
+    known = {s["speaker"] for s in current}
+    created_labels = list((snapshot or {}).get("created_labels") or [])
+    slot_labels: dict[str, str] = {}
+    final: list[dict] = []
+    for item in normalized:
+        target = item["target"]
+        if target == _NEW_SLOT_TOKEN:
+            slot = item.get("slot")
+            if not slot:
+                raise ValueError("新建说话人必须指定槽位")
+            if slot not in slot_labels:
+                slot_labels[slot] = next_speaker_label(current, created_labels)
+                created_labels.append(slot_labels[slot])
+            speaker = slot_labels[slot]
+        else:
+            if target not in known:
+                raise ValueError(f"说话人不存在: {target}")
+            speaker = target
+        final.append(
+            {"speaker": speaker, "start": item["start"], "end": item["end"]}
+        )
+    if all(seg["speaker"] == original["speaker"] for seg in final):
+        raise ValueError("至少一个结果区间不是原说话人才允许保存")
+
+    segments: list[dict] = []
+    for i, seg in enumerate(current):
+        if i == segment_index:
+            segments.extend(final)
+        else:
+            segments.append(dict(seg))
+    return {
+        "version": CORRECTIONS_VERSION,
+        "base_fingerprint": base_fingerprint or diarization_fingerprint(base_segments),
+        "segments": segments,
+        "created_labels": created_labels,
+        "revision": int((snapshot or {}).get("revision") or 0) + 1,
         "updated_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
     }
 
