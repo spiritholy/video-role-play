@@ -4,6 +4,7 @@ import {
   useRef,
   useState,
   type MouseEvent as ReactMouseEvent,
+  type PointerEvent as ReactPointerEvent,
 } from "react";
 
 interface Stage {
@@ -118,6 +119,43 @@ function isSegmentActive(
     playing.start === seg.start &&
     playing.end === seg.end
   );
+}
+
+// 切分结果区间最小宽度（秒），与后端校验保持一致。
+const MIN_SPLIT_SECONDS = 0.1;
+const SPLIT_EPS = 1e-9;
+
+interface SplitInterval {
+  key: string;
+  start: number;
+  end: number;
+}
+
+// 保存切分时的结果区间协议：target 为现有说话人标签；"__new__" 表示新建
+// 说话人，slot 是草稿内的槽位标识（同一槽位后端映射为同一个 SPEAKER_XX）。
+interface SplitResult {
+  start: number;
+  end: number;
+  target: string;
+  slot?: string;
+}
+
+// 由间隔线推导相邻结果区间：起点/间隔线/终点顺序切分。
+function splitIntervals(start: number, end: number, markers: number[]): SplitInterval[] {
+  const points = [start, ...markers, end];
+  return points.slice(0, -1).map((a, i) => ({
+    key: `iv${i}`,
+    start: a,
+    end: points[i + 1],
+  }));
+}
+
+// 新建说话人槽位的 API 协议标记（与后端保持一致）。
+const NEW_SLOT_TOKEN = "__new__";
+const NEW_SLOT_PREFIX = "new-slot-";
+
+function isNewSlotTarget(target: string | undefined): boolean {
+  return Boolean(target && target.startsWith(NEW_SLOT_PREFIX));
 }
 
 interface Task {
@@ -344,6 +382,38 @@ export default function App() {
       } catch {
         setCorrectionError((prev) => ({ ...prev, [task.id]: "无法连接后端服务" }));
         return false;
+      }
+    },
+    [applyTimeline],
+  );
+
+  const splitSegment = useCallback(
+    async (
+      task: Task,
+      segment: TimelineSegment,
+      results: SplitResult[],
+    ): Promise<{ ok: boolean; detail: string | null }> => {
+      try {
+        const resp = await fetch(
+          `/api/tasks/${task.id}/segments/${segment.index}/split`,
+          {
+            method: "PUT",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ results }),
+          },
+        );
+        const payload = await resp.json().catch(() => null);
+        if (!resp.ok) {
+          return { ok: false, detail: payload?.detail ?? "保存切分失败" };
+        }
+        applyTimeline({
+          taskId: task.id,
+          workspaceKey: workspaceKey(task),
+          timeline: payload,
+        });
+        return { ok: true, detail: null };
+      } catch {
+        return { ok: false, detail: "无法连接后端服务" };
       }
     },
     [applyTimeline],
@@ -764,6 +834,7 @@ export default function App() {
           onStoreVoiceprint={(label) => handleStoreVoiceprint(t, label)}
           voiceprintBusy={(rowLabel) => Boolean(voiceprintBusy[`${t.id}:${rowLabel}`])}
           onReassign={(segment, target) => reassignSegment(t, segment, target)}
+          onSplit={(segment, results) => splitSegment(t, segment, results)}
           onDiscard={() => discardCorrections(t)}
           correctionError={correctionError[t.id] ?? null}
         />
@@ -1291,6 +1362,7 @@ function SpeakerTimeline({
   onStoreVoiceprint,
   voiceprintBusy,
   onReassign,
+  onSplit,
   onDiscard,
   correctionError,
 }: {
@@ -1309,6 +1381,10 @@ function SpeakerTimeline({
   onStoreVoiceprint: (label: string) => Promise<void>;
   voiceprintBusy: (label: string) => boolean;
   onReassign: (segment: TimelineSegment, target: string) => Promise<boolean>;
+  onSplit: (
+    segment: TimelineSegment,
+    results: SplitResult[],
+  ) => Promise<{ ok: boolean; detail: string | null }>;
   onDiscard: () => Promise<void>;
   correctionError: string | null;
 }) {
@@ -1424,6 +1500,7 @@ function SpeakerTimeline({
           editable={correction.editable}
           onPlay={onPlay}
           onReassign={onReassign}
+          onSplit={onSplit}
           initial={detail}
           onClose={() => setDetail(null)}
         />
@@ -1504,7 +1581,7 @@ function SegmentTrack({
 
 // 校正详情弹窗：约 1000px 宽。顶部是全片总览（所有说话人、时间对齐、1px 最小
 // 宽度、悬停显示固定 8 秒放大镜），点击总览中的时段选中它；下方是选中时段的
-// 操作面板占位（试听与改派可用，切分等精细操作由后续版本提供）。
+// 操作面板：试听、改派与完整切分（添加/拖动/删除间隔线、结果区间分配、保存）。
 function DetailModal({
   taskId,
   timeline,
@@ -1513,6 +1590,7 @@ function DetailModal({
   editable,
   onPlay,
   onReassign,
+  onSplit,
   initial,
   onClose,
 }: {
@@ -1527,10 +1605,15 @@ function DetailModal({
     seg: Pick<TimelineSegment, "start" | "end">,
   ) => void;
   onReassign: (segment: TimelineSegment, target: string) => Promise<boolean>;
+  onSplit: (
+    segment: TimelineSegment,
+    results: SplitResult[],
+  ) => Promise<{ ok: boolean; detail: string | null }>;
   initial: { speaker: string; segment: TimelineSegment };
   onClose: () => void;
 }) {
   const [selected, setSelected] = useState(initial);
+  const [draftDirty, setDraftDirty] = useState(false);
   const [hoverTime, setHoverTime] = useState<number | null>(null);
   const [hoverX, setHoverX] = useState(0);
   const [overviewWidth, setOverviewWidth] = useState(0);
@@ -1583,13 +1666,35 @@ function DetailModal({
     setHoverTime(Math.min(duration, (x / rect.width) * duration));
   }
 
+  // 未保存切分草稿时，关闭弹窗或切换时段都需要用户确认放弃。
+  function confirmClose() {
+    if (
+      draftDirty &&
+      !window.confirm("当前时段有未保存的切分草稿，放弃并退出校正详情？")
+    ) {
+      return;
+    }
+    onClose();
+  }
+
+  function handleSelect(speakerLabel: string, seg: TimelineSegment) {
+    if (
+      draftDirty &&
+      !window.confirm("当前时段有未保存的切分草稿，放弃并切换到另一个时段？")
+    ) {
+      return;
+    }
+    setDraftDirty(false);
+    setSelected({ speaker: speakerLabel, segment: seg });
+  }
+
   useEffect(() => {
     function onKeyDown(event: KeyboardEvent) {
-      if (event.key === "Escape") onClose();
+      if (event.key === "Escape") confirmClose();
     }
     window.addEventListener("keydown", onKeyDown);
     return () => window.removeEventListener("keydown", onKeyDown);
-  }, [onClose]);
+  }, [confirmClose]);
 
   const magnifierWidth = 360;
   const magnifierLeft =
@@ -1601,7 +1706,7 @@ function DetailModal({
     <div
       className="detail-modal-backdrop"
       role="presentation"
-      onMouseDown={onClose}
+      onMouseDown={confirmClose}
     >
       <div
         className="detail-modal"
@@ -1616,7 +1721,7 @@ function DetailModal({
             type="button"
             className="detail-modal-close"
             aria-label="关闭"
-            onClick={onClose}
+            onClick={confirmClose}
           >
             ×
           </button>
@@ -1646,9 +1751,7 @@ function DetailModal({
                   color={color}
                   playing={playing}
                   selectedKey={`${selected.speaker}:${selected.segment.index}`}
-                  onSelect={(speakerLabel, seg) =>
-                    setSelected({ speaker: speakerLabel, segment: seg })
-                  }
+                  onSelect={handleSelect}
                   variant="overview"
                 />
               </div>
@@ -1697,41 +1800,22 @@ function DetailModal({
             </div>
           )}
         </div>
-        <div className="operation-panel">
-          <div className="operation-panel-head">
-            <span className="dot" style={{ background: selectedColor }} />
-            <strong>{selectedSpeaker ? shownName(names, selectedSpeaker) : selected.speaker}</strong>
-            <span className="operation-panel-meta">
-              {fmtTime(selected.segment.start)} – {fmtTime(selected.segment.end)}
-            </span>
-            {isSegmentActive(taskId, playing, selected.speaker, selected.segment) && (
-              <span className="operation-panel-playing">试听中</span>
-            )}
-          </div>
-          <p className="operation-panel-hint">
-            操作面板占位：试听与改派可用，切分等精细校正将在后续提供。
-          </p>
-          <div className="operation-panel-actions">
-            <button
-              type="button"
-              onClick={() => onPlay(taskId, selected.speaker, selected.segment)}
-            >
-              试听选中时段
-            </button>
-            <button
-              type="button"
-              disabled={!editable}
-              title={
-                editable
-                  ? `改派 ${fmtTime(selected.segment.start)} – ${fmtTime(selected.segment.end)} 的说话人`
-                  : "任务运行中或校正已锁定"
-              }
-              onClick={() => setReassigning(selected.segment)}
-            >
-              改派说话人
-            </button>
-          </div>
-        </div>
+        <SplitPanel
+          key={`${selected.speaker}:${selected.segment.index}`}
+          taskId={taskId}
+          segment={selected.segment}
+          originalSpeaker={selected.speaker}
+          speakerColorValue={selectedColor}
+          timeline={timeline}
+          names={names}
+          editable={editable}
+          playing={playing}
+          onPlay={() => onPlay(taskId, selected.speaker, selected.segment)}
+          onReassign={() => setReassigning(selected.segment)}
+          onSplit={onSplit}
+          onSaved={onClose}
+          onDirtyChange={setDraftDirty}
+        />
         {reassigning && (
           <ReassignDialog
             segment={reassigning}
@@ -1747,6 +1831,393 @@ function DetailModal({
             }}
           />
         )}
+      </div>
+    </div>
+  );
+}
+
+// 选中时段操作面板：把选中时段整体拉宽展示，点击添加切分间隔线、拖动微调、
+// 悬停间隔线时上方显示删除按钮；每个结果区间可分配给现有说话人或草稿内新建
+// 槽位。切分草稿不参与生效时段，保存前完整校验并一次性替换原时段。
+function SplitPanel({
+  taskId,
+  segment,
+  originalSpeaker,
+  speakerColorValue,
+  timeline,
+  names,
+  editable,
+  playing,
+  onPlay,
+  onReassign,
+  onSplit,
+  onSaved,
+  onDirtyChange,
+}: {
+  taskId: string;
+  segment: TimelineSegment;
+  originalSpeaker: string;
+  speakerColorValue: string;
+  timeline: Timeline;
+  names: Record<string, string>;
+  editable: boolean;
+  playing: Playing | null;
+  onPlay: () => void;
+  onReassign: () => void;
+  onSplit: (
+    segment: TimelineSegment,
+    results: SplitResult[],
+  ) => Promise<{ ok: boolean; detail: string | null }>;
+  onSaved: () => void;
+  onDirtyChange: (dirty: boolean) => void;
+}) {
+  const start = segment.start;
+  const end = segment.end;
+  const [markers, setMarkers] = useState<number[]>([]);
+  // 与结果区间一一对应的目标数组：现有说话人标签，或草稿新建槽位 id。
+  const [targets, setTargets] = useState<string[]>([originalSpeaker]);
+  const [slots, setSlots] = useState<string[]>([]);
+  const [nextSlot, setNextSlot] = useState(1);
+  const [hovered, setHovered] = useState<number | null>(null);
+  const [dragging, setDragging] = useState<number | null>(null);
+  const [error, setError] = useState<string | null>(null);
+  const [saving, setSaving] = useState(false);
+  const trackRef = useRef<HTMLDivElement | null>(null);
+  const dragGuard = useRef(false);
+
+  const intervals = splitIntervals(start, end, markers);
+  const dirty =
+    markers.length > 0 ||
+    slots.length > 0 ||
+    targets.some((t) => t !== originalSpeaker);
+  useEffect(() => {
+    onDirtyChange(dirty);
+  }, [dirty, onDirtyChange]);
+
+  const originalSpeakerInfo = timeline.speakers.find(
+    (sp) => sp.label === originalSpeaker,
+  );
+  const pct = (t: number) =>
+    `${(((t - start) / (end - start)) * 100).toFixed(3)}%`;
+
+  function timeFromClientX(clientX: number): number | null {
+    const el = trackRef.current;
+    if (!el) return null;
+    const rect = el.getBoundingClientRect();
+    if (rect.width <= 0) return null;
+    const frac = Math.min(1, Math.max(0, (clientX - rect.left) / rect.width));
+    return start + frac * (end - start);
+  }
+
+  function addMarker(time: number) {
+    if (!editable || time <= start || time >= end) return;
+    const next = [...markers, time].sort((a, b) => a - b);
+    const points = [start, ...next, end];
+    for (let i = 1; i < points.length - 1; i++) {
+      if (points[i] - points[i - 1] < MIN_SPLIT_SECONDS - SPLIT_EPS) {
+        setError("间隔线间距不足 0.1 秒，无法在该位置添加");
+        return;
+      }
+    }
+    const insertAt = intervals.findIndex((iv) => time <= iv.end + SPLIT_EPS);
+    const idx = insertAt < 0 ? intervals.length - 1 : insertAt;
+    const newTargets = [...targets];
+    // 新区间继承被切开区间的目标
+    newTargets.splice(idx + 1, 0, targets[idx] ?? originalSpeaker);
+    setMarkers(next);
+    setTargets(newTargets);
+    setError(null);
+  }
+
+  function deleteMarker(markerIndex: number) {
+    if (!editable) return;
+    setMarkers((prev) => prev.filter((_, i) => i !== markerIndex));
+    setTargets((prev) => {
+      const next = [...prev];
+      // 合并相邻两个区间，保留左侧目标
+      next.splice(markerIndex + 1, 1);
+      return next;
+    });
+    setHovered(null);
+    setError(null);
+  }
+
+  function discardDraft() {
+    setMarkers([]);
+    setTargets([originalSpeaker]);
+    setSlots([]);
+    setNextSlot(1);
+    setError(null);
+  }
+
+  function addSlot() {
+    if (!editable) return;
+    setSlots((prev) => [...prev, `new-slot-${nextSlot}`]);
+    setNextSlot((n) => n + 1);
+    setError(null);
+  }
+
+  function markerBounds(index: number): { lower: number; upper: number } {
+    const prev = index > 0 ? markers[index - 1] : start;
+    const nextBound = index < markers.length - 1 ? markers[index + 1] : end;
+    return { lower: prev + MIN_SPLIT_SECONDS, upper: nextBound - MIN_SPLIT_SECONDS };
+  }
+
+  function onMarkerPointerDown(
+    event: ReactPointerEvent<HTMLDivElement>,
+    index: number,
+  ) {
+    if (!editable) return;
+    event.preventDefault();
+    event.stopPropagation();
+    dragGuard.current = true;
+    setDragging(index);
+    event.currentTarget.setPointerCapture(event.pointerId);
+  }
+
+  function onMarkerPointerMove(
+    event: ReactPointerEvent<HTMLDivElement>,
+    index: number,
+  ) {
+    if (dragging !== index) return;
+    const time = timeFromClientX(event.clientX);
+    if (time === null) return;
+    const { lower, upper } = markerBounds(index);
+    const clamped = Math.min(Math.max(time, lower), upper);
+    if (Math.abs(clamped - markers[index]) > SPLIT_EPS) {
+      dragGuard.current = true;
+    }
+    setMarkers((prev) => {
+      const next = [...prev];
+      next[index] = clamped;
+      return next;
+    });
+    setError(null);
+  }
+
+  function onMarkerPointerUp(
+    event: ReactPointerEvent<HTMLDivElement>,
+    index: number,
+  ) {
+    if (dragging !== index) return;
+    setDragging(null);
+    try {
+      event.currentTarget.releasePointerCapture(event.pointerId);
+    } catch {
+      // 指针捕获已释放时忽略
+    }
+  }
+
+  function onTrackClick(event: ReactMouseEvent<HTMLDivElement>) {
+    if (!editable) return;
+    if (dragGuard.current) {
+      dragGuard.current = false;
+      return;
+    }
+    const time = timeFromClientX(event.clientX);
+    if (time !== null) addMarker(time);
+  }
+
+  function validate(): string | null {
+    if (intervals.length < 2) return "至少需要两个结果区间才能保存";
+    for (const iv of intervals) {
+      if (iv.end - iv.start < MIN_SPLIT_SECONDS - SPLIT_EPS) {
+        return "每个结果区间至少 0.1 秒";
+      }
+    }
+    for (let i = 0; i < intervals.length; i++) {
+      if (!targets[i]) return "所有结果区间都必须指定说话人";
+    }
+    if (intervals.every((_, i) => targets[i] === originalSpeaker)) {
+      return "至少一个结果区间需要改派为非原说话人才能保存";
+    }
+    return null;
+  }
+
+  async function save() {
+    const problem = validate();
+    if (problem) {
+      setError(problem);
+      return;
+    }
+    const results: SplitResult[] = intervals.map((iv, i) => {
+      const target = targets[i];
+      if (isNewSlotTarget(target)) {
+        return { start: iv.start, end: iv.end, target: NEW_SLOT_TOKEN, slot: target };
+      }
+      return { start: iv.start, end: iv.end, target };
+    });
+    setSaving(true);
+    const outcome = await onSplit(segment, results);
+    setSaving(false);
+    if (!outcome.ok) {
+      setError(outcome.detail ?? "保存切分失败");
+      return;
+    }
+    onSaved();
+  }
+
+  function targetLabel(target: string): string {
+    if (isNewSlotTarget(target)) {
+      const n = slots.indexOf(target);
+      return n >= 0 ? `新建说话人 ${n + 1}` : target;
+    }
+    return target;
+  }
+
+  const playingThis =
+    playing !== null &&
+    playing.taskId === taskId &&
+    playing.speaker === originalSpeaker &&
+    playing.start === start &&
+    playing.end === end;
+
+  return (
+    <div className="operation-panel">
+      <div className="operation-panel-head">
+        <span className="dot" style={{ background: speakerColorValue }} />
+        <strong>{originalSpeakerInfo ? shownName(names, originalSpeakerInfo) : originalSpeaker}</strong>
+        <span className="operation-panel-meta">
+          {fmtTime(start)} – {fmtTime(end)}
+        </span>
+        {playingThis && <span className="operation-panel-playing">试听中</span>}
+      </div>
+      <p className="operation-panel-hint">
+        点击拉宽时间轴添加切分间隔线，拖动微调位置，悬停间隔线可删除；试听始终播放整个选中时段。
+      </p>
+      <div className="operation-panel-actions">
+        <button type="button" onClick={onPlay}>
+          试听整个选中时段
+        </button>
+        <button
+          type="button"
+          disabled={!editable}
+          title={editable ? "把整个选中时段改派给另一个说话人" : "任务运行中或校正已锁定"}
+          onClick={onReassign}
+        >
+          改派说话人
+        </button>
+        <button type="button" onClick={addSlot} disabled={!editable}>
+          新建说话人槽位
+        </button>
+        {dirty && (
+          <button type="button" onClick={discardDraft} disabled={!editable}>
+            放弃草稿
+          </button>
+        )}
+      </div>
+      <div className="split-track">
+        <div
+          className="split-track-canvas"
+          ref={trackRef}
+          onPointerDown={() => {
+            dragGuard.current = false;
+          }}
+          onClick={onTrackClick}
+        >
+          {intervals.map((iv, i) => {
+            const label = targets[i];
+            const color =
+              label && !isNewSlotTarget(label)
+                ? speakerColor(timeline.speakers, label)
+                : "#b8bec7";
+            return (
+              <div
+                key={iv.key}
+                className="split-interval"
+                style={{
+                  left: pct(iv.start),
+                  width: pct(iv.end - iv.start),
+                  background: color,
+                }}
+                title={`${label ? targetLabel(label) : "未指定"} · ${fmtTime(iv.start)} – ${fmtTime(iv.end)}`}
+              />
+            );
+          })}
+          {markers.map((m, index) => (
+            <div
+              key={`m${index}`}
+              className="split-marker"
+              style={{ left: pct(m) }}
+              onPointerDown={(e) => onMarkerPointerDown(e, index)}
+              onPointerMove={(e) => onMarkerPointerMove(e, index)}
+              onPointerUp={(e) => onMarkerPointerUp(e, index)}
+              onMouseEnter={() => setHovered(index)}
+              onMouseLeave={() => setHovered((h) => (h === index ? null : h))}
+            >
+              <div className="split-marker-line" />
+              {hovered === index && editable && (
+                <button
+                  type="button"
+                  className="split-marker-delete"
+                  title="删除此间隔线"
+                  onClick={(e) => {
+                    e.stopPropagation();
+                    deleteMarker(index);
+                  }}
+                >
+                  ×
+                </button>
+              )}
+            </div>
+          ))}
+        </div>
+        <div className="split-axis">
+          <span>{fmtTime(start)}</span>
+          <span>{fmtTime(end)}</span>
+        </div>
+      </div>
+      <div className="split-intervals">
+        <div className="split-intervals-title">
+          结果区间（{intervals.length} 个）——默认继承原说话人，可改选现有说话人或新建槽位
+        </div>
+        {intervals.map((iv, i) => (
+          <div key={iv.key} className="split-interval-row">
+            <span className="split-interval-time">
+              {fmtTime(iv.start)} – {fmtTime(iv.end)}
+            </span>
+            <select
+              value={targets[i] ?? ""}
+              disabled={!editable}
+              onChange={(e) => {
+                const next = [...targets];
+                next[i] = e.target.value;
+                setTargets(next);
+                setError(null);
+              }}
+            >
+              <option value="" disabled>
+                选择说话人
+              </option>
+              {timeline.speakers.map((sp) => (
+                <option key={sp.label} value={sp.label}>
+                  {shownName(names, sp)}
+                </option>
+              ))}
+              {slots.map((slot, n) => (
+                <option key={slot} value={slot}>
+                  新建说话人 {n + 1}
+                </option>
+              ))}
+            </select>
+          </div>
+        ))}
+      </div>
+      {slots.length > 0 && (
+        <p className="operation-panel-hint">
+          新建说话人槽位保存后按现有规则顺延为 SPEAKER_XX；同一个槽位分配给多个区间时映射为同一个标签。
+        </p>
+      )}
+      {error && <p className="error-text">{error}</p>}
+      <div className="split-panel-actions">
+        <button
+          type="button"
+          className="primary"
+          onClick={() => void save()}
+          disabled={saving || !editable}
+        >
+          {saving ? "保存中…" : "保存切分"}
+        </button>
       </div>
     </div>
   );
