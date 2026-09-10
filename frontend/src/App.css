@@ -297,9 +297,17 @@ button.resume {
   color: #86909c;
 }
 
+.timeline-canvas {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  min-width: 100%;
+  width: 100%;
+}
+
 .timeline-row {
   display: grid;
-  grid-template-columns: minmax(150px, auto) 1fr;
+  grid-template-columns: minmax(150px, auto) minmax(0, 1fr);
   align-items: center;
   gap: 12px;
 }
@@ -367,11 +375,21 @@ button.store-voiceprint:disabled {
 }
 
 .timeline-track {
+  width: 100%;
   position: relative;
-  height: 20px;
+  height: auto;
+  min-height: 20px;
   background: #eceff2;
   border-radius: 4px;
-  overflow: hidden;
+  overflow-x: auto;
+  overflow-y: hidden;
+}
+
+.timeline-track-canvas {
+  position: relative;
+  height: 20px;
+  min-width: 100%;
+  width: var(--timeline-track-width, 100%);
 }
 
 .timeline-seg {
@@ -399,11 +417,17 @@ button.store-voiceprint:disabled {
 
 .timeline-axis {
   display: grid;
-  grid-template-columns: minmax(150px, auto) 1fr;
+  grid-template-columns: minmax(150px, auto) minmax(0, 1fr);
   gap: 12px;
 }
 
-.timeline-axis > div {
+.timeline-axis-scroll {
+  overflow: hidden;
+}
+
+.timeline-axis-canvas {
+  width: var(--timeline-track-width, 100%);
+  min-width: 100%;
   display: flex;
   justify-content: space-between;
   font-size: 11px;

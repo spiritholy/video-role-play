@@ -3,6 +3,7 @@ import {
   useEffect,
   useRef,
   useState,
+  type CSSProperties,
   type PointerEvent as ReactPointerEvent,
 } from "react";
 
@@ -92,6 +93,9 @@ const SPEAKER_COLORS = [
   "#4f7cff", "#e0533d", "#2ba24c", "#9d5bd2",
   "#e8a13a", "#2ab5b5", "#d45791", "#7a8699",
 ];
+
+// 最短段的最小可视宽度；当最短段正好是 1 秒时，1 秒宽度就是 1px。
+const MIN_SECOND_PX = 1;
 
 function speakerColor(speakers: TimelineSpeaker[], label: string): string {
   const i = speakers.findIndex((s) => s.label === label);
@@ -1353,6 +1357,18 @@ function SpeakerTimeline({
     playing.end === seg.end;
 
   const allSegments = timeline.speakers.flatMap((sp) => sp.segments);
+  const shortestSegment = allSegments.reduce<number | null>((shortest, seg) => {
+    const duration = seg.end - seg.start;
+    return duration > 0 && (shortest === null || duration < shortest)
+      ? duration
+      : shortest;
+  }, null);
+  const pxPerSecond = shortestSegment
+    ? Math.max(MIN_SECOND_PX, MIN_SECOND_PX / shortestSegment)
+    : MIN_SECOND_PX;
+  const timelineTrackWidth = timeline.duration > 0
+    ? `${(timeline.duration * pxPerSecond).toFixed(3)}px`
+    : "0px";
   const shownTimeline = (() => {
     if (dragging === null || !correction.editable) return timeline;
     const { segment, side, time } = dragging;
@@ -1426,8 +1442,9 @@ function SpeakerTimeline({
   function moveBoundaryDrag(event: ReactPointerEvent<HTMLDivElement>) {
     if (dragging === null) return;
     const track = event.currentTarget.closest<HTMLElement>(".timeline-track");
-    if (!track || timeline.duration <= 0) return;
-    const rect = track.getBoundingClientRect();
+    const canvas = track?.querySelector<HTMLElement>(".timeline-track-canvas");
+    if (!canvas || timeline.duration <= 0) return;
+    const rect = canvas.getBoundingClientRect();
     if (rect.width <= 0) return;
     const time = ((event.clientX - rect.left) / rect.width) * timeline.duration;
     setDragging((prev) =>
@@ -1468,136 +1485,146 @@ function SpeakerTimeline({
         </div>
       )}
       {correctionError && <p className="error-text">{correctionError}</p>}
-      {shownTimeline.speakers.map((sp) => {
-        const color = speakerColor(timeline.speakers, sp.label);
-        const samples = samplesBySpeaker[sp.label] ?? [];
-        return (
-          <div key={sp.label} className="timeline-row">
-            <span className="speaker-chip">
-              <span className="dot" style={{ background: color }} />
-              <SpeakerName
-                label={sp.label}
-                name={names[sp.label] ?? sp.name ?? null}
-                auto={Boolean(sp.auto && !names[sp.label])}
-                editable={correction.editable}
-                onRename={onRename}
-              />
-              <span className="speech-time">{fmtTime(sp.speech_time)}</span>
-              <button
-                type="button"
-                className="store-voiceprint"
-                disabled={voiceprintBusy(sp.label)}
-                title={`从 ${shown(sp)} 的当前生效时段抽取声纹并存入声纹库`}
-                onClick={() => void onStoreVoiceprint(sp.label)}
-              >
-                {voiceprintBusy(sp.label) ? "存入中…" : "存入声纹库"}
-              </button>
-            </span>
-            <div className="timeline-track">
-              {sp.segments.map((seg) => (
-                <div
-                  key={seg.index}
-                  className="timeline-seg-wrap"
-                  style={{
-                    left: pct(seg.start),
-                    width: pct(seg.end - seg.start),
-                  }}
-                >
-                  {correction.editable &&
-                    !allSegments.some(
-                      (other) =>
-                        other.index !== seg.index &&
-                        Math.abs(other.end - seg.start) < 0.0005,
-                    ) && (
-                      <div
-                        className="timeline-edge start"
-                        title={`拖拽 ${shown(sp)} 的开始边界`}
-                        role="separator"
-                        aria-orientation="vertical"
-                        onPointerDown={(event) => startBoundaryDrag(event, seg, "start")}
-                        onPointerMove={moveBoundaryDrag}
-                        onPointerUp={() => finishBoundaryDrag(true)}
-                        onPointerCancel={() => finishBoundaryDrag(false)}
-                      />
-                    )}
-                  <button
-                    type="button"
-                    className={`timeline-seg${isActive(sp, seg) ? " playing" : ""}`}
-                    style={{ background: color }}
-                    title={`${shown(sp)} · ${fmtTime(seg.start)} – ${fmtTime(seg.end)}`}
-                    aria-label={`试听 ${shown(sp)}，${fmtTime(seg.start)} 到 ${fmtTime(seg.end)}`}
-                    onClick={() => onPlay(taskId, sp.label, seg)}
+      <div className="timeline-body">
+        <div
+          className="timeline-canvas"
+          style={{ "--timeline-track-width": timelineTrackWidth } as CSSProperties}
+        >
+          {shownTimeline.speakers.map((sp) => {
+            const color = speakerColor(timeline.speakers, sp.label);
+            const samples = samplesBySpeaker[sp.label] ?? [];
+            return (
+              <div key={sp.label} className="timeline-row">
+                <span className="speaker-chip">
+                  <span className="dot" style={{ background: color }} />
+                  <SpeakerName
+                    label={sp.label}
+                    name={names[sp.label] ?? sp.name ?? null}
+                    auto={Boolean(sp.auto && !names[sp.label])}
+                    editable={correction.editable}
+                    onRename={onRename}
                   />
-                  {correction.editable &&
-                    !allSegments.some(
-                      (other) =>
-                        other.index !== seg.index &&
-                        Math.abs(other.start - seg.end) < 0.0005,
-                    ) && (
-                      <div
-                        className="timeline-edge end"
-                        title={`拖拽 ${shown(sp)} 的结束边界`}
-                        role="separator"
-                        aria-orientation="vertical"
-                        onPointerDown={(event) => startBoundaryDrag(event, seg, "end")}
-                        onPointerMove={moveBoundaryDrag}
-                        onPointerUp={() => finishBoundaryDrag(true)}
-                        onPointerCancel={() => finishBoundaryDrag(false)}
-                      />
-                    )}
+                  <span className="speech-time">{fmtTime(sp.speech_time)}</span>
                   <button
                     type="button"
-                    className="timeline-seg-edit"
-                    disabled={!correction.editable}
-                    title={`改派 ${fmtTime(seg.start)} – ${fmtTime(seg.end)} 的说话人`}
-                    aria-label={`改派 ${fmtTime(seg.start)} 到 ${fmtTime(seg.end)} 的说话人时段`}
-                    onClick={() => {
-                      setTarget("__new__");
-                      setReassigning(seg);
-                    }}
+                    className="store-voiceprint"
+                    disabled={voiceprintBusy(sp.label)}
+                    title={`从 ${shown(sp)} 的当前生效时段抽取声纹并存入声纹库`}
+                    onClick={() => void onStoreVoiceprint(sp.label)}
                   >
-                    改
+                    {voiceprintBusy(sp.label) ? "存入中…" : "存入声纹库"}
                   </button>
+                </span>
+                <div className="timeline-track">
+                  <div className="timeline-track-canvas">
+                    {sp.segments.map((seg) => (
+                      <div
+                        key={seg.index}
+                        className="timeline-seg-wrap"
+                        style={{
+                          left: pct(seg.start),
+                          width: pct(seg.end - seg.start),
+                        }}
+                      >
+                        {correction.editable &&
+                          !allSegments.some(
+                            (other) =>
+                              other.index !== seg.index &&
+                              Math.abs(other.end - seg.start) < 0.0005,
+                          ) && (
+                            <div
+                              className="timeline-edge start"
+                              title={`拖拽 ${shown(sp)} 的开始边界`}
+                              role="separator"
+                              aria-orientation="vertical"
+                              onPointerDown={(event) => startBoundaryDrag(event, seg, "start")}
+                              onPointerMove={moveBoundaryDrag}
+                              onPointerUp={() => finishBoundaryDrag(true)}
+                              onPointerCancel={() => finishBoundaryDrag(false)}
+                            />
+                          )}
+                        <button
+                          type="button"
+                          className={`timeline-seg${isActive(sp, seg) ? " playing" : ""}`}
+                          style={{ background: color }}
+                          title={`${shown(sp)} · ${fmtTime(seg.start)} – ${fmtTime(seg.end)}`}
+                          aria-label={`试听 ${shown(sp)}，${fmtTime(seg.start)} 到 ${fmtTime(seg.end)}`}
+                          onClick={() => onPlay(taskId, sp.label, seg)}
+                        />
+                        {correction.editable &&
+                          !allSegments.some(
+                            (other) =>
+                              other.index !== seg.index &&
+                              Math.abs(other.start - seg.end) < 0.0005,
+                          ) && (
+                            <div
+                              className="timeline-edge end"
+                              title={`拖拽 ${shown(sp)} 的结束边界`}
+                              role="separator"
+                              aria-orientation="vertical"
+                              onPointerDown={(event) => startBoundaryDrag(event, seg, "end")}
+                              onPointerMove={moveBoundaryDrag}
+                              onPointerUp={() => finishBoundaryDrag(true)}
+                              onPointerCancel={() => finishBoundaryDrag(false)}
+                            />
+                          )}
+                        <button
+                          type="button"
+                          className="timeline-seg-edit"
+                          disabled={!correction.editable}
+                          title={`改派 ${fmtTime(seg.start)} – ${fmtTime(seg.end)} 的说话人`}
+                          aria-label={`改派 ${fmtTime(seg.start)} 到 ${fmtTime(seg.end)} 的说话人时段`}
+                          onClick={() => {
+                            setTarget("__new__");
+                            setReassigning(seg);
+                          }}
+                        >
+                          改
+                        </button>
+                      </div>
+                    ))}
+                  </div>
                 </div>
-              ))}
-            </div>
-            {samples.length > 0 && (
-              <div className="speaker-samples">
-                <span className="samples-label">样本台词</span>
-                <div className="sample-list">
-                  {samples.map((s, i) => (
-                    <button
-                      key={i}
-                      type="button"
-                      className={`sample${isActive(sp, s) ? " playing" : ""}`}
-                      title={`试听 ${shown(sp)} 的样本 ${fmtTime(s.start)} – ${fmtTime(s.end)}`}
-                      onClick={() => onPlay(taskId, sp.label, s)}
-                    >
-                      <span className="sample-time">
-                        {fmtTime(s.start)}–{fmtTime(s.end)}
-                      </span>
-                      <span className="sample-text">
-                        {s.text || "（无可识别台词）"}
-                      </span>
-                    </button>
+                {samples.length > 0 && (
+                  <div className="speaker-samples">
+                    <span className="samples-label">样本台词</span>
+                    <div className="sample-list">
+                      {samples.map((s, i) => (
+                        <button
+                          key={i}
+                          type="button"
+                          className={`sample${isActive(sp, s) ? " playing" : ""}`}
+                          title={`试听 ${shown(sp)} 的样本 ${fmtTime(s.start)} – ${fmtTime(s.end)}`}
+                          onClick={() => onPlay(taskId, sp.label, s)}
+                        >
+                          <span className="sample-time">
+                            {fmtTime(s.start)}–{fmtTime(s.end)}
+                          </span>
+                          <span className="sample-text">
+                            {s.text || "（无可识别台词）"}
+                          </span>
+                        </button>
+                      ))}
+                    </div>
+                  </div>
+                )}
+              </div>
+            );
+          })}
+          {timeline.duration > 0 && (
+            <div className="timeline-axis">
+              <span />
+              <div className="timeline-axis-scroll">
+                <div className="timeline-axis-canvas">
+                  {Array.from({ length: 5 }, (_, i) => (
+                    <span key={i}>{fmtTime((timeline.duration * i) / 4)}</span>
                   ))}
                 </div>
               </div>
-            )}
-          </div>
-        );
-      })}
-      {timeline.duration > 0 && (
-        <div className="timeline-axis">
-          <span />
-          <div>
-            {Array.from({ length: 5 }, (_, i) => (
-              <span key={i}>{fmtTime((timeline.duration * i) / 4)}</span>
-            ))}
-          </div>
-          <span />
+            </div>
+          )}
         </div>
-      )}
+      </div>
       {reassigning && (
         <div
           className="correction-dialog-backdrop"
