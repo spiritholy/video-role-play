@@ -4,6 +4,7 @@ import pytest
 
 from app.corrections import (
     apply_reassignment,
+    apply_segment_delete,
     diarization_fingerprint,
     effective_segments,
     next_speaker_label,
@@ -73,6 +74,50 @@ def test_快照状态按基础分离指纹作废():
     assert snapshot_state(changed, snapshot) == "invalidated"
     assert snapshot_state(BASE, {"segments": BASE}) == "invalidated"
     assert snapshot_state(BASE, None) == "none"
+
+
+def test_重叠时段快照仍视为有效():
+    """基础分离可能产生相邻/嵌套重叠（如 pyannote 输出），快照继承后不应
+    因重叠整体作废：否则任何校正写入都会立刻被锁定。"""
+    base = [
+        {"speaker": "SPEAKER_00", "start": 0.2, "end": 0.9},
+        {"speaker": "SPEAKER_01", "start": 0.95, "end": 1.25},
+        {"speaker": "SPEAKER_01", "start": 2.0, "end": 4.0},
+        {"speaker": "SPEAKER_00", "start": 2.5, "end": 2.8},
+    ]
+    snapshot = {
+        "version": 1,
+        "base_fingerprint": diarization_fingerprint(base),
+        "segments": base,
+    }
+    assert snapshot_state(base, snapshot) == "active"
+    assert effective_segments(base, None, snapshot) == snapshot["segments"]
+
+
+def test_结构非法时段仍判作废():
+    """放宽重叠后仍保留结构校验：类型/有限数值/start<end/非空说话人。"""
+    for bad in (
+        [{"speaker": "SPEAKER_00", "start": 0.9, "end": 0.2}],  # start >= end
+        [{"speaker": "", "start": 0.2, "end": 0.9}],  # 空说话人
+        [{"speaker": "SPEAKER_00", "start": float("nan"), "end": 0.9}],  # 非有限
+        [{"speaker": 123, "start": 0.2, "end": 0.9}],  # 说话人类型非法
+    ):
+        snapshot = {
+            "version": 1,
+            "base_fingerprint": diarization_fingerprint(bad),
+            "segments": bad,
+        }
+        assert snapshot_state(bad, snapshot) == "invalidated"
+
+
+def test_删除会留下结构非法时段时拒绝生成快照():
+    """删除护栏：不写一份写入即作废的快照（结构非法时抛 ValueError）。"""
+    base = [
+        {"speaker": "SPEAKER_00", "start": 0.2, "end": 0.9},
+        {"speaker": "SPEAKER_01", "start": 1.0, "end": 0.5},
+    ]
+    with pytest.raises(ValueError, match="无法生成有效校正快照"):
+        apply_segment_delete(base, None, 0, diarization_fingerprint(base))
 
 
 def test_声纹改派建议按时段并入并允许命名目标():

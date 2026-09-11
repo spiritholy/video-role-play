@@ -81,7 +81,8 @@ class SplitResultIn(BaseModel):
 
 
 class SegmentSplitIn(BaseModel):
-    results: list[SplitResultIn] = Field(min_length=2)
+    # 单个结果区间 = 整段改说话人（不产生切分）；多个区间按切分规则校验。
+    results: list[SplitResultIn] = Field(min_length=1)
 
 
 
@@ -606,9 +607,10 @@ def create_app(
     def split_segment(task_id: str, segment_index: int, body: SegmentSplitIn):
         """人工切分一个生效时段：按连续结果区间一次性替换原时段。
 
-        结果区间必须至少两个、每段至少 0.1 秒、按时间连续且精确覆盖原时段、
-        全部指定说话人、至少一段改变归属；同槽位新建说话人映射同一标签。
-        校验失败不产生部分保存；成功时原子替换并返回刷新后的时间轴。
+        单结果区间表示整段改说话人（不要求 0.1 秒）；多结果区间时每段至少
+        0.1 秒、按时间连续且精确覆盖原时段。区间必须全部指定说话人、至少
+        一个区间改变归属；同槽位新建说话人映射同一标签。校验失败不产生部分
+        保存；成功时原子替换并返回刷新后的时间轴。
         """
         task = _require_task(manager, task_id)
         raw = _load_diarization(task)
@@ -631,6 +633,33 @@ def create_app(
             message = str(e)
             status_code = 404 if message == "说话人时段不存在" else 400
             raise HTTPException(status_code=status_code, detail=message)
+        return _timeline_payload(task)
+
+    @app.delete("/api/tasks/{task_id}/segments/{segment_index}")
+    def delete_segment(task_id: str, segment_index: int):
+        """人工删除一个生效时段：该区间不再归属任何说话人，立即保存快照。
+
+        删除后该时间区间在时间轴留白，不参与擦除掩码与声纹校验；其余时段
+        保持相对顺序不变。校验失败不产生部分保存。
+        """
+        task = _require_task(manager, task_id)
+        raw = _load_diarization(task)
+        snapshot, state = _correction_snapshot(task, raw)
+        status = _correction_status(
+            task, snapshot, state, manager.workspace_busy(str(task.workspace_dir))
+        )
+        if not status["editable"]:
+            raise HTTPException(status_code=409, detail=status["locked_reason"])
+        try:
+            updated = corrections.apply_segment_delete(
+                raw.get("segments", []),
+                snapshot,
+                segment_index,
+                _diarization_fingerprint(raw),
+            )
+            corrections.write_corrections(Path(task.workspace_dir), updated)
+        except ValueError as e:
+            raise HTTPException(status_code=404, detail=str(e))
         return _timeline_payload(task)
 
     @app.delete("/api/tasks/{task_id}/corrections")

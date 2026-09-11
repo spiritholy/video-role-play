@@ -75,10 +75,9 @@ def _valid_segments(value) -> list[dict] | None:
         if not isinstance(speaker, str) or not speaker or not math.isfinite(start) or not math.isfinite(end) or start >= end:
             return None
         result.append({"speaker": speaker, "start": start, "end": end})
-    # 快照是一份完整生效时段表；任何重叠都违反互斥归属，按无效快照回退。
-    ordered = sorted(result, key=lambda item: (item["start"], item["end"]))
-    if any(a["end"] > b["start"] for a, b in zip(ordered, ordered[1:])):
-        return None
+    # 基础说话人分离（如 pyannote）可能产生相邻/嵌套重叠时段，时间轴与
+    # 擦除/声纹路径都按原样消费；快照继承后应立即可用，重叠不整体作废，
+    # 这里只校验结构合法性（类型/有限数值/start<end/非空说话人）。
     return result
 
 
@@ -226,10 +225,12 @@ def apply_segment_split(
 ) -> dict:
     """按间隔线把一个生效时段拆成相邻结果区间，返回新的完整时段快照。
 
-    results 是「按时间排序的连续区间」列表，每项含 start/end/target：
-    target 为现有说话人标签，或 "__new__"（此时必须带 slot 槽位标识，
-    同一个 slot 映射为同一个顺延的 SPEAKER_XX 标签）。校验失败抛
-    ValueError；函数是纯函数，调用方负责把返回的快照持久化。
+    单个结果区间表示整段改说话人（不要求 0.1 秒宽度）；多个结果区间按切分
+    校验（每段至少 0.1 秒、连续且精确覆盖原时段）。results 是「按时间排序
+    的连续区间」列表，每项含 start/end/target：target 为现有说话人标签，或
+    "__new__"（此时必须带 slot 槽位标识，同一个 slot 映射为同一个顺延的
+    SPEAKER_XX 标签）。校验失败抛 ValueError；函数是纯函数，调用方负责
+    把返回的快照持久化。
     """
     if snapshot_state(base_segments, snapshot, base_fingerprint) != "active":
         snapshot = None  # 无效快照不继承修订号或历史新建说话人
@@ -239,8 +240,6 @@ def apply_segment_split(
     original = current[segment_index]
 
     normalized = _validate_split_results(results)
-    if len(normalized) < 2:
-        raise ValueError("至少需要两个结果区间")
 
     tol = _SPLIT_TOLERANCE
     if abs(normalized[0]["start"] - original["start"]) > tol:
@@ -252,9 +251,10 @@ def apply_segment_split(
             raise ValueError("结果区间必须按时间连续且互不重叠")
         if b["start"] > a["end"] + tol:
             raise ValueError("结果区间必须按时间连续且精确覆盖原时段")
-    for item in normalized:
-        if item["end"] - item["start"] + tol < MIN_SPLIT_SECONDS:
-            raise ValueError("每个结果区间至少 0.1 秒")
+    if len(normalized) > 1:
+        for item in normalized:
+            if item["end"] - item["start"] + tol < MIN_SPLIT_SECONDS:
+                raise ValueError("每个结果区间至少 0.1 秒")
 
     known = {s["speaker"] for s in current}
     created_labels = list((snapshot or {}).get("created_labels") or [])
@@ -291,6 +291,37 @@ def apply_segment_split(
         "base_fingerprint": base_fingerprint or diarization_fingerprint(base_segments),
         "segments": segments,
         "created_labels": created_labels,
+        "revision": int((snapshot or {}).get("revision") or 0) + 1,
+        "updated_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+    }
+
+
+def apply_segment_delete(
+    base_segments: list[dict],
+    snapshot: dict | None,
+    segment_index: int,
+    base_fingerprint: str | None = None,
+) -> dict:
+    """删除一个生效时段：该区间不再归属任何说话人，返回新的完整时段快照。
+
+    segment_index 是生效时段在原始分离顺序中的索引；删除不改变其余时段的
+    相对顺序，快照保持该顺序以便跨任务稳定定位。函数是纯函数，调用方负责
+    持久化。
+    """
+    if snapshot_state(base_segments, snapshot, base_fingerprint) != "active":
+        snapshot = None  # 无效快照不继承修订号或历史新建说话人
+    current = _effective_snapshot_segments(base_segments, snapshot, base_fingerprint)
+    if not isinstance(segment_index, int) or not 0 <= segment_index < len(current):
+        raise ValueError("说话人时段不存在")
+    segments = [dict(s) for i, s in enumerate(current) if i != segment_index]
+    if _valid_segments(segments) is None:
+        # 护栏：不写一份写入即作废的快照；调用方把 ValueError 映射为 4xx。
+        raise ValueError("删除失败：无法生成有效校正快照")
+    return {
+        "version": CORRECTIONS_VERSION,
+        "base_fingerprint": base_fingerprint or diarization_fingerprint(base_segments),
+        "segments": segments,
+        "created_labels": list((snapshot or {}).get("created_labels") or []),
         "revision": int((snapshot or {}).get("revision") or 0) + 1,
         "updated_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
     }
