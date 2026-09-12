@@ -225,12 +225,12 @@ def apply_segment_split(
 ) -> dict:
     """按间隔线把一个生效时段拆成相邻结果区间，返回新的完整时段快照。
 
-    单个结果区间表示整段改说话人（不要求 0.1 秒宽度）；多个结果区间按切分
-    校验（每段至少 0.1 秒、连续且精确覆盖原时段）。results 是「按时间排序
-    的连续区间」列表，每项含 start/end/target：target 为现有说话人标签，或
-    "__new__"（此时必须带 slot 槽位标识，同一个 slot 映射为同一个顺延的
-    SPEAKER_XX 标签）。校验失败抛 ValueError；函数是纯函数，调用方负责
-    把返回的快照持久化。
+    结果区间必须至少两个、每段至少 0.1 秒、按时间连续且精确覆盖原时段、
+    全部指定说话人、至少一个区间改变归属；整段改说话人只走改派端点
+    （PUT /segments/{i}/speaker）。results 是「按时间排序的连续区间」列表，
+    每项含 start/end/target：target 为现有说话人标签，或 "__new__"（此时
+    必须带 slot 槽位标识，同一个 slot 映射为同一个顺延的 SPEAKER_XX 标签）。
+    校验失败抛 ValueError；函数是纯函数，调用方负责把返回的快照持久化。
     """
     if snapshot_state(base_segments, snapshot, base_fingerprint) != "active":
         snapshot = None  # 无效快照不继承修订号或历史新建说话人
@@ -240,6 +240,8 @@ def apply_segment_split(
     original = current[segment_index]
 
     normalized = _validate_split_results(results)
+    if len(normalized) < 2:
+        raise ValueError("至少需要两个结果区间")
 
     tol = _SPLIT_TOLERANCE
     if abs(normalized[0]["start"] - original["start"]) > tol:
@@ -251,10 +253,9 @@ def apply_segment_split(
             raise ValueError("结果区间必须按时间连续且互不重叠")
         if b["start"] > a["end"] + tol:
             raise ValueError("结果区间必须按时间连续且精确覆盖原时段")
-    if len(normalized) > 1:
-        for item in normalized:
-            if item["end"] - item["start"] + tol < MIN_SPLIT_SECONDS:
-                raise ValueError("每个结果区间至少 0.1 秒")
+    for item in normalized:
+        if item["end"] - item["start"] + tol < MIN_SPLIT_SECONDS:
+            raise ValueError("每个结果区间至少 0.1 秒")
 
     known = {s["speaker"] for s in current}
     created_labels = list((snapshot or {}).get("created_labels") or [])

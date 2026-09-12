@@ -2257,12 +2257,13 @@ function SplitPanel({
   }
 
   function validate(): string | null {
-    // 单个结果区间 = 整段改说话人（不切分），不要求 0.1 秒宽度。
-    if (intervals.length > 1) {
-      for (const iv of intervals) {
-        if (iv.end - iv.start < MIN_SPLIT_SECONDS - SPLIT_EPS) {
-          return "每个结果区间至少 0.1 秒";
-        }
+    // 切分必须至少两个结果区间；整段改说话人只走改派对话框。
+    if (intervals.length < 2) {
+      return "至少需要两个结果区间才能保存";
+    }
+    for (const iv of intervals) {
+      if (iv.end - iv.start < MIN_SPLIT_SECONDS - SPLIT_EPS) {
+        return "每个结果区间至少 0.1 秒";
       }
     }
     for (let i = 0; i < intervals.length; i++) {
@@ -2357,7 +2358,8 @@ function SplitPanel({
     if (!editable || dirty || saving) return;
     if (
       !window.confirm(
-        "删除该时段？该区间将不再归属任何说话人，不参与擦除与声纹校验。",
+        "删除该时段？该区间将不再归属任何说话人，不参与擦除与声纹校验。" +
+          "\n\n删除后只能通过「放弃全部校正」恢复。",
       )
     ) {
       return;

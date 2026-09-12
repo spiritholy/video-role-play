@@ -5,6 +5,7 @@ import pytest
 from app.corrections import (
     apply_reassignment,
     apply_segment_delete,
+    apply_segment_split,
     diarization_fingerprint,
     effective_segments,
     next_speaker_label,
@@ -118,6 +119,26 @@ def test_删除会留下结构非法时段时拒绝生成快照():
     ]
     with pytest.raises(ValueError, match="无法生成有效校正快照"):
         apply_segment_delete(base, None, 0, diarization_fingerprint(base))
+
+
+def test_切分至少需要两个结果区间():
+    with pytest.raises(ValueError, match="至少需要两个结果区间"):
+        apply_segment_split(
+            BASE, None, 0,
+            [{"start": 0.2, "end": 0.9, "target": "SPEAKER_01"}],
+        )
+
+
+def test_切分每个结果区间无条件至少零点一秒():
+    # 两区间中一段不足 0.1 秒：不再因"整段改说话人"豁免
+    with pytest.raises(ValueError, match="每个结果区间至少 0.1 秒"):
+        apply_segment_split(
+            BASE, None, 0,
+            [
+                {"start": 0.2, "end": 0.25, "target": "SPEAKER_00"},
+                {"start": 0.25, "end": 0.9, "target": "SPEAKER_01"},
+            ],
+        )
 
 
 def test_声纹改派建议按时段并入并允许命名目标():

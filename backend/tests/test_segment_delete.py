@@ -1,4 +1,4 @@
-"""删除说话人时段 API 闭环：时间轴移出/留白语义/放弃恢复/锁定/索引稳定。"""
+"""删除说话人时段 API 闭环：时间轴移出/留白语义/放弃恢复/锁定/索引稳定/护栏 400。"""
 
 from pathlib import Path
 
@@ -103,6 +103,20 @@ def test_删除不存在的时段返回404(client, tmp_path):
     resp = delete_segment(client, task["id"], 99)
     assert resp.status_code == 404, resp.text
     assert "说话人时段不存在" in resp.json()["detail"]
+
+
+def test_删除护栏_剩余时段结构非法时返回400(tmp_path):
+    """删除后无法生成有效校正快照（剩余段结构非法）时返回 400 而非 404。"""
+    video = make_video(tmp_path)
+    turns = (
+        SpeakerSegment("SPEAKER_00", 0.2, 0.9),
+        SpeakerSegment("SPEAKER_01", 1.0, 0.5),  # 结构非法：start >= end
+    )
+    with make_client(tmp_path, diarizer=CannedDiarizer(turns=turns)) as client:
+        task = run_to_analysis(client, video)
+        resp = delete_segment(client, task["id"], 0)
+        assert resp.status_code == 400, resp.text
+        assert "删除失败：无法生成有效校正快照" in resp.json()["detail"]
 
 
 def test_工作区任务运行中删除锁定(tmp_path):

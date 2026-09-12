@@ -1,4 +1,4 @@
-"""时段切分 API 闭环：合法切分/新建槽位复用/非法草稿/锁定/作废/继承/生效读取。"""
+"""时段切分 API 闭环：合法切分/新建槽位复用/单区间拒绝/非法草稿/锁定/作废/继承/生效读取。"""
 
 import json
 from pathlib import Path
@@ -215,47 +215,62 @@ def test_切分请求结构非法由协议层拒绝(client, tmp_path):
     )
     assert resp.status_code == 400
     assert resp.json()["detail"] == "结果区间时间非法"
-    # 只有一个结果区间且不改变归属：无变化不保存
+    # 只有一个结果区间：协议层直接拒绝（切分至少需要两个结果区间）
     resp = split(
         client,
         task["id"],
         0,
         [{"start": 0.2, "end": 0.9, "target": "SPEAKER_00"}],
     )
-    assert resp.status_code == 400
-    assert resp.json()["detail"] == "至少一个结果区间不是原说话人才允许保存"
+    assert resp.status_code == 422
 
 
-def test_单区间仅改说话人_直接保存且其余时段不变(client, tmp_path):
+def test_单区间切分被协议层拒绝_整段改说话人走改派唯一路径(client, tmp_path):
     video = make_video(tmp_path)
     task = run_to_analysis(client, video)
+    # 单区间切分：协议层拒绝（至少需要两个结果区间），不产生快照
     resp = split(
         client,
         task["id"],
         0,
         [{"start": 0.2, "end": 0.9, "target": "SPEAKER_01"}],
     )
+    assert resp.status_code == 422, resp.text
+    assert not snapshot_file(Path(task["workspace_dir"])).is_file()
+    data = timeline(client, task["id"])
+    assert data["correction"]["state"] == "none"
+    assert segment_by_index(data, 0)[0]["label"] == "SPEAKER_00"
+    # 整段改说话人只走改派唯一路径：直接保存且其余时段不变
+    resp = client.put(
+        f"/api/tasks/{task['id']}/segments/0/speaker",
+        json={"target": "SPEAKER_01"},
+    )
     assert resp.status_code == 200, resp.text
     body = resp.json()
     assert body["correction"]["state"] == "active"
     assert body["correction"]["revision"] == 1
-    # 原时段整段改派给 SPEAKER_01，其余时段保持位置
     assert segment_by_index(body, 0)[0]["label"] == "SPEAKER_01"
     assert segment_by_index(body, 0)[1] == {"start": 0.2, "end": 0.9, "index": 0}
-    # 其余时段保持位置与归属
     assert segment_by_index(body, 1)[0]["label"] == "SPEAKER_01"
     assert segment_by_index(body, 2)[0]["label"] == "SPEAKER_00"
     assert snapshot_file(Path(task["workspace_dir"])).is_file()
 
 
-def test_单区间新建说话人_直接保存为顺延标签(client, tmp_path):
+def test_单区间新建说话人_切分被拒绝_改派路径承接(client, tmp_path):
     video = make_video(tmp_path)
     task = run_to_analysis(client, video)
+    # 单区间切分（含新建说话人）被协议层拒绝
     resp = split(
         client,
         task["id"],
         0,
         [{"start": 0.2, "end": 0.9, "target": "__new__", "slot": "新角色"}],
+    )
+    assert resp.status_code == 422, resp.text
+    # 新建说话人整段改派走改派唯一路径：顺延标签直接保存
+    resp = client.put(
+        f"/api/tasks/{task['id']}/segments/0/speaker",
+        json={"target": "__new__"},
     )
     assert resp.status_code == 200, resp.text
     body = resp.json()
@@ -263,7 +278,8 @@ def test_单区间新建说话人_直接保存为顺延标签(client, tmp_path):
     assert body["correction"]["revision"] == 1
 
 
-def test_单区间不产生切分_不足零点一秒的时段仍可改说话人(tmp_path):
+def test_不足零点一秒的时段经改派路径改说话人(tmp_path):
+    """移除单区间切分后，短时段整段改说话人的能力由改派对话框承接。"""
     video = make_video(tmp_path)
     turns = (
         SpeakerSegment("SPEAKER_00", 0.2, 0.25),
@@ -271,11 +287,18 @@ def test_单区间不产生切分_不足零点一秒的时段仍可改说话人(
     )
     with make_client(tmp_path, diarizer=CannedDiarizer(turns=turns)) as client:
         task = run_to_analysis(client, video)
+        # 单区间切分被协议层拒绝
         resp = split(
             client,
             task["id"],
             0,
             [{"start": 0.2, "end": 0.25, "target": "SPEAKER_01"}],
+        )
+        assert resp.status_code == 422, resp.text
+        # 不足 0.1 秒的时段仍可通过改派对话框改说话人
+        resp = client.put(
+            f"/api/tasks/{task['id']}/segments/0/speaker",
+            json={"target": "SPEAKER_01"},
         )
         assert resp.status_code == 200, resp.text
         body = resp.json()
