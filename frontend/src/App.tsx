@@ -8,7 +8,39 @@ import {
   type MouseEvent as ReactMouseEvent,
   type PointerEvent as ReactPointerEvent,
 } from "react";
-import { audioUrl } from "./api/urls";
+import { errorMessage } from "./api/client";
+import { fetchDiarization, fetchTranscripts } from "./api/analysis";
+import {
+  deleteCorrections,
+  putSegmentSpeaker,
+  putSegmentSplit,
+  putSpeakerName,
+  removeSegment,
+} from "./api/corrections";
+import {
+  cancelTask,
+  createTask,
+  listTasks,
+  probeVideo,
+  resumeTask,
+  startErase,
+} from "./api/tasks";
+import {
+  deleteVoiceprintCheck,
+  deleteVoiceprintEntry,
+  getVoiceprintCheck,
+  listVoiceprints,
+  postSuggestionDecision,
+  postVoiceprintCheck,
+  storeSpeakerVoiceprint,
+} from "./api/voiceprints";
+import {
+  deleteWorkspace,
+  listWorkspaces,
+  openWorkspace,
+  resumeWorkspace,
+} from "./api/workspaces";
+import { audioSegmentUrl, audioUrl } from "./api/urls";
 import {
   dirName,
   fileName,
@@ -42,9 +74,10 @@ import type {
   TimelineOrError,
   TimelineSegment,
   TimelineSpeaker,
+  MutationOutcome,
+  SplitOutcome,
   TimelineUpdate,
   TranscriptSample,
-  Transcripts,
   TranscriptsOrError,
   VoiceprintCheckState,
   VoiceprintList,
@@ -90,28 +123,24 @@ export default function App() {
   const maybeFetchTimeline = useCallback(
     async (t: Task) => {
       if (!t.stages.some((s) => s.id === "diarize" && s.status === "done")) return;
-      try {
-        const resp = await fetch(`/api/tasks/${t.id}/diarization`);
-        if (!resp.ok) {
-          setTimelines((prev) => ({ ...prev, [t.id]: "error" }));
-          return;
-        }
-        const data: Timeline = await resp.json();
-        setTimelines((prev) => ({ ...prev, [t.id]: data }));
-        const wsKey = workspaceKey(t);
-        // 本地镜像只收手工命名：自动认出来的名字带 auto 标记，由时间轴接口
-        // 的 name/auto 直接展示，不冒充手工命名（否则「自动」徽标会丢失）
-        setSpeakerNames((prev) => ({
-          ...prev,
-          [wsKey]: Object.fromEntries(
-            data.speakers
-              .filter((s) => s.name && !s.auto)
-              .map((s) => [s.label, s.name as string]),
-          ),
-        }));
-      } catch {
+      const result = await fetchDiarization(t.id);
+      if (!result.ok) {
         setTimelines((prev) => ({ ...prev, [t.id]: "error" }));
+        return;
       }
+      const data = result.data;
+      setTimelines((prev) => ({ ...prev, [t.id]: data }));
+      const wsKey = workspaceKey(t);
+      // 本地镜像只收手工命名：自动认出来的名字带 auto 标记，由时间轴接口
+      // 的 name/auto 直接展示，不冒充手工命名（否则「自动」徽标会丢失）
+      setSpeakerNames((prev) => ({
+        ...prev,
+        [wsKey]: Object.fromEntries(
+          data.speakers
+            .filter((s) => s.name && !s.auto)
+            .map((s) => [s.label, s.name as string]),
+        ),
+      }));
     },
     [],
   );
@@ -131,33 +160,20 @@ export default function App() {
   const reassignSegment = useCallback(
     async (task: Task, segment: TimelineSegment, target: string) => {
       setCorrectionError((prev) => ({ ...prev, [task.id]: null }));
-      try {
-        const resp = await fetch(
-          `/api/tasks/${task.id}/segments/${segment.index}/speaker`,
-          {
-            method: "PUT",
-            headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({ target }),
-          },
-        );
-        const payload = await resp.json().catch(() => null);
-        if (!resp.ok) {
-          setCorrectionError((prev) => ({
-            ...prev,
-            [task.id]: payload?.detail ?? "改派说话人失败",
-          }));
-          return false;
-        }
-        applyTimeline({
-          taskId: task.id,
-          workspaceKey: workspaceKey(task),
-          timeline: payload,
-        });
-        return true;
-      } catch {
-        setCorrectionError((prev) => ({ ...prev, [task.id]: "无法连接后端服务" }));
+      const result = await putSegmentSpeaker(task.id, segment.index, target);
+      if (!result.ok) {
+        setCorrectionError((prev) => ({
+          ...prev,
+          [task.id]: errorMessage(result, "改派说话人失败"),
+        }));
         return false;
       }
+      applyTimeline({
+        taskId: task.id,
+        workspaceKey: workspaceKey(task),
+        timeline: result.data,
+      });
+      return true;
     },
     [applyTimeline],
   );
@@ -167,29 +183,17 @@ export default function App() {
       task: Task,
       segment: TimelineSegment,
       results: SplitResult[],
-    ): Promise<{ ok: boolean; detail: string | null; timeline?: Timeline }> => {
-      try {
-        const resp = await fetch(
-          `/api/tasks/${task.id}/segments/${segment.index}/split`,
-          {
-            method: "PUT",
-            headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({ results }),
-          },
-        );
-        const payload = await resp.json().catch(() => null);
-        if (!resp.ok) {
-          return { ok: false, detail: payload?.detail ?? "保存切分失败" };
-        }
-        applyTimeline({
-          taskId: task.id,
-          workspaceKey: workspaceKey(task),
-          timeline: payload,
-        });
-        return { ok: true, detail: null, timeline: payload };
-      } catch {
-        return { ok: false, detail: "无法连接后端服务" };
+    ): Promise<SplitOutcome> => {
+      const result = await putSegmentSplit(task.id, segment.index, results);
+      if (!result.ok) {
+        return { ok: false, detail: errorMessage(result, "保存切分失败") };
       }
+      applyTimeline({
+        taskId: task.id,
+        workspaceKey: workspaceKey(task),
+        timeline: result.data,
+      });
+      return { ok: true, detail: null, timeline: result.data };
     },
     [applyTimeline],
   );
@@ -198,29 +202,20 @@ export default function App() {
     async (
       task: Task,
       segment: TimelineSegment,
-    ): Promise<{ ok: boolean; detail: string | null }> => {
+    ): Promise<MutationOutcome> => {
       setCorrectionError((prev) => ({ ...prev, [task.id]: null }));
-      try {
-        const resp = await fetch(
-          `/api/tasks/${task.id}/segments/${segment.index}`,
-          { method: "DELETE" },
-        );
-        const payload = await resp.json().catch(() => null);
-        if (!resp.ok) {
-          const detail = payload?.detail ?? "删除时段失败";
-          setCorrectionError((prev) => ({ ...prev, [task.id]: detail }));
-          return { ok: false, detail };
-        }
-        applyTimeline({
-          taskId: task.id,
-          workspaceKey: workspaceKey(task),
-          timeline: payload,
-        });
-        return { ok: true, detail: null };
-      } catch {
-        setCorrectionError((prev) => ({ ...prev, [task.id]: "无法连接后端服务" }));
-        return { ok: false, detail: "无法连接后端服务" };
+      const result = await removeSegment(task.id, segment.index);
+      if (!result.ok) {
+        const detail = errorMessage(result, "删除时段失败");
+        setCorrectionError((prev) => ({ ...prev, [task.id]: detail }));
+        return { ok: false, detail };
       }
+      applyTimeline({
+        taskId: task.id,
+        workspaceKey: workspaceKey(task),
+        timeline: result.data,
+      });
+      return { ok: true, detail: null };
     },
     [applyTimeline],
   );
@@ -228,26 +223,19 @@ export default function App() {
   const discardCorrections = useCallback(
     async (task: Task) => {
       setCorrectionError((prev) => ({ ...prev, [task.id]: null }));
-      try {
-        const resp = await fetch(`/api/tasks/${task.id}/corrections`, {
-          method: "DELETE",
-        });
-        const payload = await resp.json().catch(() => null);
-        if (!resp.ok) {
-          setCorrectionError((prev) => ({
-            ...prev,
-            [task.id]: payload?.detail ?? "放弃校正失败",
-          }));
-          return;
-        }
-        applyTimeline({
-          taskId: task.id,
-          workspaceKey: workspaceKey(task),
-          timeline: payload,
-        });
-      } catch {
-        setCorrectionError((prev) => ({ ...prev, [task.id]: "无法连接后端服务" }));
+      const result = await deleteCorrections(task.id);
+      if (!result.ok) {
+        setCorrectionError((prev) => ({
+          ...prev,
+          [task.id]: errorMessage(result, "放弃校正失败"),
+        }));
+        return;
       }
+      applyTimeline({
+        taskId: task.id,
+        workspaceKey: workspaceKey(task),
+        timeline: result.data,
+      });
     },
     [applyTimeline],
   );
@@ -259,28 +247,17 @@ export default function App() {
       rawName: string,
     ): Promise<string | null | undefined> => {
       const wsKey = workspaceKey(task);
-      try {
-        const resp = await fetch(
-          `/api/tasks/${task.id}/speakers/${encodeURIComponent(label)}/name`,
-          {
-            method: "PUT",
-            headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({ name: rawName }),
-          },
-        );
-        if (!resp.ok) return undefined;
-        const data: { label: string; name: string | null } = await resp.json();
-        setIngestWarnings((prev) => ({ ...prev, [task.id]: null }));
-        setSpeakerNames((prev) => {
-          const forWs = { ...(prev[wsKey] ?? {}) };
-          if (data.name) forWs[label] = data.name;
-          else delete forWs[label];
-          return { ...prev, [wsKey]: forWs };
-        });
-        return data.name;
-      } catch {
-        return undefined;
-      }
+      const result = await putSpeakerName(task.id, label, rawName);
+      if (!result.ok) return undefined;
+      const data = result.data;
+      setIngestWarnings((prev) => ({ ...prev, [task.id]: null }));
+      setSpeakerNames((prev) => {
+        const forWs = { ...(prev[wsKey] ?? {}) };
+        if (data.name) forWs[label] = data.name;
+        else delete forWs[label];
+        return { ...prev, [wsKey]: forWs };
+      });
+      return data.name;
     },
     [],
   );
@@ -290,17 +267,11 @@ export default function App() {
       if (!t.stages.some((s) => s.id === "transcribe" && s.status === "done")) return;
       if (requestedTranscripts.current.has(t.id)) return;
       requestedTranscripts.current.add(t.id);
-      try {
-        const resp = await fetch(`/api/tasks/${t.id}/transcripts`);
-        if (!resp.ok) {
-          setTranscripts((prev) => ({ ...prev, [t.id]: "error" }));
-          return;
-        }
-        const data: Transcripts = await resp.json();
-        setTranscripts((prev) => ({ ...prev, [t.id]: data }));
-      } catch {
-        setTranscripts((prev) => ({ ...prev, [t.id]: "error" }));
-      }
+      const result = await fetchTranscripts(t.id);
+      setTranscripts((prev) => ({
+        ...prev,
+        [t.id]: result.ok ? result.data : "error",
+      }));
     },
     [],
   );
@@ -310,46 +281,41 @@ export default function App() {
     const active = t.voiceprint_check && ["queued", "running"].includes(t.voiceprint_check.state);
     if (!active && requestedChecks.current.has(t.id)) return;
     requestedChecks.current.add(t.id);
-    try {
-      const resp = await fetch(`/api/tasks/${t.id}/voiceprint-check`);
-      if (!resp.ok) return;
-      const data: VoiceprintCheckState = await resp.json();
+    const result = await getVoiceprintCheck(t.id);
+    // 失败时不动状态，下一轮轮询重试
+    if (result.ok) {
+      const data = result.data;
       setCheckStates((prev) => ({ ...prev, [t.id]: data }));
-    } catch {
-      // 下一轮轮询重试
     }
   }, []);
 
   const refreshWorkspaces = useCallback(async () => {
-    try {
-      const resp = await fetch("/api/workspaces");
-      if (!resp.ok) return;
-      setWorkspaces(await resp.json());
-    } catch {
-      // 后端暂不可达时保留旧列表，下一轮重试
+    const result = await listWorkspaces();
+    // 后端暂不可达时保留旧列表，下一轮重试
+    if (result.ok) {
+      const data = result.data;
+      setWorkspaces(data);
     }
   }, []);
 
   const refreshVoiceprints = useCallback(async () => {
-    try {
-      const resp = await fetch("/api/voiceprints");
-      if (!resp.ok) return;
-      setVoiceprints(await resp.json());
-    } catch {
-      // 后端暂不可达时保留旧列表，下一轮重试
+    const result = await listVoiceprints();
+    // 后端暂不可达时保留旧列表，下一轮重试
+    if (result.ok) {
+      const data = result.data;
+      setVoiceprints(data);
     }
   }, []);
 
   const refresh = useCallback(async () => {
-    try {
-      const resp = await fetch("/api/tasks");
-      const data = await resp.json();
+    const result = await listTasks();
+    // 后端暂不可达时保留旧列表，下一轮重试
+    if (result.ok) {
+      const data = result.data;
       setTasks(data.tasks);
       data.tasks.forEach(maybeFetchTimeline);
       data.tasks.forEach(maybeFetchTranscripts);
       data.tasks.forEach(maybeFetchCheck);
-    } catch {
-      // 后端暂不可达时保留旧列表，下一轮重试
     }
     refreshWorkspaces();
     refreshVoiceprints();
@@ -395,7 +361,7 @@ export default function App() {
     if (!audioRef.current) audioRef.current = new Audio();
     const audio = audioRef.current;
     audio.pause();
-    audio.src = `/api/tasks/${taskId}/audio-segment?start=${seg.start}&end=${seg.end}`;
+    audio.src = audioSegmentUrl(taskId, seg);
     audio.onended = () => setPlaying(null);
     audio.play().catch(() => setPlaying(null));
     setPlaying({ taskId, speaker, start: seg.start, end: seg.end });
@@ -409,25 +375,16 @@ export default function App() {
       return;
     }
     setProbing(true);
-    try {
-      const resp = await fetch("/api/probe", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ video_path: videoPath.trim() }),
-      });
-      const data = await resp.json();
-      if (!resp.ok) {
-        setFormError(data.detail ?? "探测失败");
-        return;
-      }
-      setProbe(data);
-      setSelectedTrack(0);
-      if (data.tracks.length === 0) setFormError("该视频没有音轨");
-    } catch {
-      setFormError("无法连接后端服务");
-    } finally {
-      setProbing(false);
+    const result = await probeVideo(videoPath.trim());
+    setProbing(false);
+    if (!result.ok) {
+      setFormError(errorMessage(result, "探测失败"));
+      return;
     }
+    const data = result.data;
+    setProbe(data);
+    setSelectedTrack(0);
+    if (data.tracks.length === 0) setFormError("该视频没有音轨");
   }
 
   async function handleSubmit(e: React.FormEvent) {
@@ -437,43 +394,28 @@ export default function App() {
       setFormError("请先填写源视频的本地路径");
       return;
     }
-    try {
-      const resp = await fetch("/api/tasks", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          video_path: videoPath.trim(),
-          audio_track: probe && probe.tracks.length > 0 ? selectedTrack : null,
-          num_speakers: numSpeakers.trim() ? Number(numSpeakers.trim()) : null,
-        }),
-      });
-      const data = await resp.json();
-      if (!resp.ok) {
-        setFormError(data.detail ?? "提交失败");
-        return;
-      }
-      refresh();
-    } catch {
-      setFormError("无法连接后端服务");
+    const result = await createTask({
+      video_path: videoPath.trim(),
+      audio_track: probe && probe.tracks.length > 0 ? selectedTrack : null,
+      num_speakers: numSpeakers.trim() ? Number(numSpeakers.trim()) : null,
+    });
+    if (!result.ok) {
+      setFormError(errorMessage(result, "提交失败"));
+      return;
     }
+    refresh();
   }
 
   async function handleCancel(id: string) {
-    await fetch(`/api/tasks/${id}/cancel`, { method: "POST" });
+    await cancelTask(id);
     refresh();
   }
 
   async function handleResume(id: string) {
     setResumeError(null);
-    try {
-      const resp = await fetch(`/api/tasks/${id}/resume`, { method: "POST" });
-      if (!resp.ok) {
-        const data = await resp.json().catch(() => null);
-        setResumeError(data?.detail ?? "续跑失败");
-        return;
-      }
-    } catch {
-      setResumeError("无法连接后端服务");
+    const result = await resumeTask(id);
+    if (!result.ok) {
+      setResumeError(errorMessage(result, "续跑失败"));
       return;
     }
     refresh();
@@ -481,18 +423,9 @@ export default function App() {
 
   async function handleResumeWorkspace(w: WorkspaceItem) {
     setWorkspaceError(null);
-    try {
-      const resp = await fetch(
-        `/api/workspaces/${encodeURIComponent(w.name)}/resume`,
-        { method: "POST" },
-      );
-      if (!resp.ok) {
-        const data = await resp.json().catch(() => null);
-        setWorkspaceError(data?.detail ?? "续跑失败");
-        return;
-      }
-    } catch {
-      setWorkspaceError("无法连接后端服务");
+    const result = await resumeWorkspace(w.name);
+    if (!result.ok) {
+      setWorkspaceError(errorMessage(result, "续跑失败"));
       return;
     }
     refresh();
@@ -500,18 +433,9 @@ export default function App() {
 
   async function handleOpenWorkspace(w: WorkspaceItem) {
     setWorkspaceError(null);
-    try {
-      const resp = await fetch(
-        `/api/workspaces/${encodeURIComponent(w.name)}/open`,
-        { method: "POST" },
-      );
-      if (!resp.ok) {
-        const data = await resp.json().catch(() => null);
-        setWorkspaceError(data?.detail ?? "打开擦除界面失败");
-        return;
-      }
-    } catch {
-      setWorkspaceError("无法连接后端服务");
+    const result = await openWorkspace(w.name);
+    if (!result.ok) {
+      setWorkspaceError(errorMessage(result, "打开擦除界面失败"));
       return;
     }
     refresh();
@@ -524,17 +448,9 @@ export default function App() {
     );
     if (!confirmed) return;
     setWorkspaceError(null);
-    try {
-      const resp = await fetch(`/api/workspaces/${encodeURIComponent(w.name)}`, {
-        method: "DELETE",
-      });
-      if (!resp.ok) {
-        const data = await resp.json().catch(() => null);
-        setWorkspaceError(data?.detail ?? "删除工作区失败");
-        return;
-      }
-    } catch {
-      setWorkspaceError("无法连接后端服务");
+    const result = await deleteWorkspace(w.name);
+    if (!result.ok) {
+      setWorkspaceError(errorMessage(result, "删除工作区失败"));
       return;
     }
     refresh();
@@ -560,34 +476,23 @@ export default function App() {
 
     setVoiceprintBusy((prev) => ({ ...prev, [key]: true }));
     setIngestWarnings((prev) => ({ ...prev, [task.id]: null }));
-    try {
-      const resp = await fetch(
-        `/api/tasks/${task.id}/speakers/${encodeURIComponent(label)}/voiceprint`,
-        { method: "POST" },
-      );
-      const data = await resp.json().catch(() => null);
-      if (!resp.ok) {
-        setIngestWarnings((prev) => ({
-          ...prev,
-          [task.id]: data?.detail ?? "存入声纹库失败",
-        }));
-        return;
-      }
+    const result = await storeSpeakerVoiceprint(task.id, label);
+    if (!result.ok) {
+      setIngestWarnings((prev) => ({
+        ...prev,
+        [task.id]: errorMessage(result, "存入声纹库失败"),
+      }));
+    } else {
+      const data = result.data;
       setIngestWarnings((prev) => ({
         ...prev,
         [task.id]: data?.voiceprint_error
           ? `声纹入库失败：${data.voiceprint_error}`
           : null,
       }));
-    } catch {
-      setIngestWarnings((prev) => ({
-        ...prev,
-        [task.id]: "无法连接后端服务",
-      }));
-    } finally {
-      setVoiceprintBusy((prev) => ({ ...prev, [key]: false }));
-      refreshVoiceprints();
     }
+    setVoiceprintBusy((prev) => ({ ...prev, [key]: false }));
+    refreshVoiceprints();
   }
 
   async function handleDeleteVoiceprint(name: string) {
@@ -596,18 +501,9 @@ export default function App() {
     );
     if (!confirmed) return;
     setVoiceprintError(null);
-    try {
-      const resp = await fetch(
-        `/api/voiceprints/${encodeURIComponent(name)}`,
-        { method: "DELETE" },
-      );
-      if (!resp.ok) {
-        const data = await resp.json().catch(() => null);
-        setVoiceprintError(data?.detail ?? "删除声纹失败");
-        return;
-      }
-    } catch {
-      setVoiceprintError("无法连接后端服务");
+    const result = await deleteVoiceprintEntry(name);
+    if (!result.ok) {
+      setVoiceprintError(errorMessage(result, "删除声纹失败"));
       return;
     }
     refreshVoiceprints();
@@ -679,35 +575,25 @@ export default function App() {
 
   async function startVoiceprintCheck(t: Task) {
     setCheckError(null);
-    try {
-      const resp = await fetch(`/api/tasks/${t.id}/voiceprint-check`, { method: "POST" });
-      if (!resp.ok) {
-        const data = await resp.json().catch(() => null);
-        setCheckError(data?.detail ?? "声纹校验启动失败");
-        return;
-      }
-      const data = await resp.json();
-      if (data.voiceprint_check) {
-        setCheckStates((prev) => ({
-          ...prev,
-          [t.id]: { ...data.voiceprint_check, result: null },
-        }));
-      }
-    } catch {
-      setCheckError("无法连接后端服务");
+    const result = await postVoiceprintCheck(t.id);
+    if (!result.ok) {
+      setCheckError(errorMessage(result, "声纹校验启动失败"));
+      return;
+    }
+    const check = result.data.voiceprint_check;
+    if (check) {
+      setCheckStates((prev) => ({
+        ...prev,
+        [t.id]: { ...check, result: null },
+      }));
     }
   }
 
   async function cancelVoiceprintCheck(t: Task) {
     setCheckError(null);
-    try {
-      const resp = await fetch(`/api/tasks/${t.id}/voiceprint-check`, { method: "DELETE" });
-      if (!resp.ok) {
-        const data = await resp.json().catch(() => null);
-        setCheckError(data?.detail ?? "取消声纹校验失败");
-      }
-    } catch {
-      setCheckError("无法连接后端服务");
+    const result = await deleteVoiceprintCheck(t.id);
+    if (!result.ok) {
+      setCheckError(errorMessage(result, "取消声纹校验失败"));
     }
   }
 
@@ -716,20 +602,11 @@ export default function App() {
     if (decisionBusy[key]) return;
     setDecisionBusy((prev) => ({ ...prev, [key]: true }));
     setCheckError(null);
-    try {
-      const resp = await fetch(
-        `/api/tasks/${t.id}/voiceprint-check/suggestions/${index}/decision`,
-        {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ decision }),
-        },
-      );
-      const data = await resp.json().catch(() => null);
-      if (!resp.ok) {
-        setCheckError(data?.detail ?? "建议裁决失败");
-        return;
-      }
+    const result = await postSuggestionDecision(t.id, index, decision);
+    if (!result.ok) {
+      setCheckError(errorMessage(result, "建议裁决失败"));
+    } else {
+      const data = result.data;
       setCheckStates((prev) => ({
         ...prev,
         [t.id]: {
@@ -741,11 +618,8 @@ export default function App() {
         },
       }));
       applyTimeline({ taskId: t.id, workspaceKey: workspaceKey(t), timeline: data.timeline });
-    } catch {
-      setCheckError("无法连接后端服务");
-    } finally {
-      setDecisionBusy((prev) => ({ ...prev, [key]: false }));
     }
+    setDecisionBusy((prev) => ({ ...prev, [key]: false }));
   }
 
   function suggestionText(s: VoiceprintSuggestion): string {
@@ -1108,26 +982,17 @@ function EraseForm({
       return;
     }
     setBusy(true);
-    try {
-      const resp = await fetch(`/api/tasks/${task.id}/erase`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          speakers: [...selected].sort(),
-          output_dir: outputDir.trim() || null,
-        }),
-      });
-      const data = await resp.json().catch(() => null);
-      if (!resp.ok) {
-        setError(data?.detail ?? "发起擦除失败");
-        return;
-      }
-      setSelected(new Set());
-    } catch {
-      setError("无法连接后端服务");
-    } finally {
-      setBusy(false);
+    const result = await startErase(
+      task.id,
+      [...selected].sort(),
+      outputDir.trim() || null,
+    );
+    setBusy(false);
+    if (!result.ok) {
+      setError(errorMessage(result, "发起擦除失败"));
+      return;
     }
+    setSelected(new Set());
   }
 
   return (
