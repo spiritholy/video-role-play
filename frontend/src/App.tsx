@@ -1,5 +1,4 @@
 import {
-  useCallback,
   useEffect,
   useLayoutEffect,
   useMemo,
@@ -9,38 +8,8 @@ import {
   type PointerEvent as ReactPointerEvent,
 } from "react";
 import { errorMessage } from "./api/client";
-import { fetchDiarization, fetchTranscripts } from "./api/analysis";
-import {
-  deleteCorrections,
-  putSegmentSpeaker,
-  putSegmentSplit,
-  putSpeakerName,
-  removeSegment,
-} from "./api/corrections";
-import {
-  cancelTask,
-  createTask,
-  listTasks,
-  probeVideo,
-  resumeTask,
-  startErase,
-} from "./api/tasks";
-import {
-  deleteVoiceprintCheck,
-  deleteVoiceprintEntry,
-  getVoiceprintCheck,
-  listVoiceprints,
-  postSuggestionDecision,
-  postVoiceprintCheck,
-  storeSpeakerVoiceprint,
-} from "./api/voiceprints";
-import {
-  deleteWorkspace,
-  listWorkspaces,
-  openWorkspace,
-  resumeWorkspace,
-} from "./api/workspaces";
-import { audioSegmentUrl, audioUrl } from "./api/urls";
+import { startErase } from "./api/tasks";
+import { audioUrl } from "./api/urls";
 import {
   dirName,
   fileName,
@@ -64,450 +33,100 @@ import {
   splitIntervals,
 } from "./lib/split";
 import { workspaceKey } from "./lib/workspace";
+import { useCorrections } from "./hooks/useCorrections";
+import { useSegmentPlayback } from "./hooks/useSegmentPlayback";
+import { useServerPolling } from "./hooks/useServerPolling";
+import { useSpeakerNaming } from "./hooks/useSpeakerNaming";
+import { useSubmitForm } from "./hooks/useSubmitForm";
+import { useTaskActions } from "./hooks/useTaskActions";
+import { useTimelineStore } from "./hooks/useTimelineStore";
+import { useVoiceprintCheck } from "./hooks/useVoiceprintCheck";
+import { useVoiceprintLibrary } from "./hooks/useVoiceprintLibrary";
+import { useWorkspaces } from "./hooks/useWorkspaces";
 import type {
   Playing,
-  ProbeResult,
   SplitInterval,
   SplitResult,
   Task,
   Timeline,
-  TimelineOrError,
   TimelineSegment,
   TimelineSpeaker,
-  MutationOutcome,
-  SplitOutcome,
-  TimelineUpdate,
   TranscriptSample,
-  TranscriptsOrError,
-  VoiceprintCheckState,
-  VoiceprintList,
   VoiceprintSuggestion,
-  WorkspaceItem,
-  WorkspaceList,
 } from "./types";
 
 export default function App() {
-  const [tasks, setTasks] = useState<Task[]>([]);
-  const [workspaces, setWorkspaces] = useState<WorkspaceList | null>(null);
-  const [voiceprints, setVoiceprints] = useState<VoiceprintList | null>(null);
-  const [voiceprintError, setVoiceprintError] = useState<string | null>(null);
-  const [workspaceError, setWorkspaceError] = useState<string | null>(null);
-  const [resumeError, setResumeError] = useState<string | null>(null);
-  const [timelines, setTimelines] = useState<Record<string, TimelineOrError>>({});
-  // 说话人命名（工作区元数据的本地镜像）：工作区 → 编号标签 → 名字。
-  // 按工作区键控：命名是工作区级数据，同源多任务卡片共享同一份显示。
-  const [speakerNames, setSpeakerNames] = useState<
-    Record<string, Record<string, string>>
-  >({});
-  const [transcripts, setTranscripts] = useState<Record<string, TranscriptsOrError>>({});
-  // 命名入库失败警告（任务 → 文案）：仅前端会话态，下次命名成功或刷新即清除。
-  const [ingestWarnings, setIngestWarnings] = useState<Record<string, string | null>>({});
-  const [voiceprintBusy, setVoiceprintBusy] = useState<Record<string, boolean>>({});
-  const [checkStates, setCheckStates] = useState<Record<string, VoiceprintCheckState>>({});
-  const [checkError, setCheckError] = useState<string | null>(null);
-  const [decisionBusy, setDecisionBusy] = useState<Record<string, boolean>>({});
-  const [playing, setPlaying] = useState<Playing | null>(null);
-  // 试听播放进度（绝对秒）：切分面板用它绘制移动播放条。
-  const [playPos, setPlayPos] = useState<number | null>(null);
-  const [correctionError, setCorrectionError] = useState<Record<string, string | null>>({});
-  const audioRef = useRef<HTMLAudioElement | null>(null);
-  const requestedTranscripts = useRef<Set<string>>(new Set());
-  const requestedChecks = useRef<Set<string>>(new Set());
-  const [videoPath, setVideoPath] = useState("");
-  const [probe, setProbe] = useState<ProbeResult | null>(null);
-  const [selectedTrack, setSelectedTrack] = useState(0);
-  const [numSpeakers, setNumSpeakers] = useState("");  // 空=让模型自动估计
-  const [formError, setFormError] = useState<string | null>(null);
-  const [probing, setProbing] = useState(false);
+  const timelineStore = useTimelineStore();
+  const voiceprintCheck = useVoiceprintCheck({
+    applyTimeline: timelineStore.applyTimeline,
+  });
+  const polling = useServerPolling({
+    loadTimeline: timelineStore.loadTimeline,
+    syncCheckState: voiceprintCheck.maybeFetchCheck,
+  });
+  const corrections = useCorrections({
+    applyTimeline: timelineStore.applyTimeline,
+  });
+  const naming = useSpeakerNaming({
+    timelines: timelineStore.timelines,
+    speakerNames: timelineStore.speakerNames,
+    applySpeakerName: timelineStore.applySpeakerName,
+    refreshVoiceprints: polling.refreshVoiceprints,
+  });
+  const library = useVoiceprintLibrary({
+    refreshVoiceprints: polling.refreshVoiceprints,
+  });
+  const workspaceActions = useWorkspaces({ refresh: polling.refresh });
+  const taskActions = useTaskActions({ refresh: polling.refresh });
+  const submitForm = useSubmitForm({ refresh: polling.refresh });
+  const playback = useSegmentPlayback();
 
-  const maybeFetchTimeline = useCallback(
-    async (t: Task) => {
-      if (!t.stages.some((s) => s.id === "diarize" && s.status === "done")) return;
-      const result = await fetchDiarization(t.id);
-      if (!result.ok) {
-        setTimelines((prev) => ({ ...prev, [t.id]: "error" }));
-        return;
-      }
-      const data = result.data;
-      setTimelines((prev) => ({ ...prev, [t.id]: data }));
-      const wsKey = workspaceKey(t);
-      // 本地镜像只收手工命名：自动认出来的名字带 auto 标记，由时间轴接口
-      // 的 name/auto 直接展示，不冒充手工命名（否则「自动」徽标会丢失）
-      setSpeakerNames((prev) => ({
-        ...prev,
-        [wsKey]: Object.fromEntries(
-          data.speakers
-            .filter((s) => s.name && !s.auto)
-            .map((s) => [s.label, s.name as string]),
-        ),
-      }));
-    },
-    [],
-  );
-
-  const applyTimeline = useCallback((data: TimelineUpdate) => {
-    setTimelines((prev) => ({ ...prev, [data.taskId]: data.timeline }));
-    setSpeakerNames((prev) => ({
-      ...prev,
-      [data.workspaceKey]: Object.fromEntries(
-        data.timeline.speakers
-          .filter((s) => s.name && !s.auto)
-          .map((s) => [s.label, s.name as string]),
-      ),
-    }));
-  }, []);
-
-  const reassignSegment = useCallback(
-    async (task: Task, segment: TimelineSegment, target: string) => {
-      setCorrectionError((prev) => ({ ...prev, [task.id]: null }));
-      const result = await putSegmentSpeaker(task.id, segment.index, target);
-      if (!result.ok) {
-        setCorrectionError((prev) => ({
-          ...prev,
-          [task.id]: errorMessage(result, "改派说话人失败"),
-        }));
-        return false;
-      }
-      applyTimeline({
-        taskId: task.id,
-        workspaceKey: workspaceKey(task),
-        timeline: result.data,
-      });
-      return true;
-    },
-    [applyTimeline],
-  );
-
-  const splitSegment = useCallback(
-    async (
-      task: Task,
-      segment: TimelineSegment,
-      results: SplitResult[],
-    ): Promise<SplitOutcome> => {
-      const result = await putSegmentSplit(task.id, segment.index, results);
-      if (!result.ok) {
-        return { ok: false, detail: errorMessage(result, "保存切分失败") };
-      }
-      applyTimeline({
-        taskId: task.id,
-        workspaceKey: workspaceKey(task),
-        timeline: result.data,
-      });
-      return { ok: true, detail: null, timeline: result.data };
-    },
-    [applyTimeline],
-  );
-
-  const deleteSegment = useCallback(
-    async (
-      task: Task,
-      segment: TimelineSegment,
-    ): Promise<MutationOutcome> => {
-      setCorrectionError((prev) => ({ ...prev, [task.id]: null }));
-      const result = await removeSegment(task.id, segment.index);
-      if (!result.ok) {
-        const detail = errorMessage(result, "删除时段失败");
-        setCorrectionError((prev) => ({ ...prev, [task.id]: detail }));
-        return { ok: false, detail };
-      }
-      applyTimeline({
-        taskId: task.id,
-        workspaceKey: workspaceKey(task),
-        timeline: result.data,
-      });
-      return { ok: true, detail: null };
-    },
-    [applyTimeline],
-  );
-
-  const discardCorrections = useCallback(
-    async (task: Task) => {
-      setCorrectionError((prev) => ({ ...prev, [task.id]: null }));
-      const result = await deleteCorrections(task.id);
-      if (!result.ok) {
-        setCorrectionError((prev) => ({
-          ...prev,
-          [task.id]: errorMessage(result, "放弃校正失败"),
-        }));
-        return;
-      }
-      applyTimeline({
-        taskId: task.id,
-        workspaceKey: workspaceKey(task),
-        timeline: result.data,
-      });
-    },
-    [applyTimeline],
-  );
-
-  const renameSpeaker = useCallback(
-    async (
-      task: Task,
-      label: string,
-      rawName: string,
-    ): Promise<string | null | undefined> => {
-      const wsKey = workspaceKey(task);
-      const result = await putSpeakerName(task.id, label, rawName);
-      if (!result.ok) return undefined;
-      const data = result.data;
-      setIngestWarnings((prev) => ({ ...prev, [task.id]: null }));
-      setSpeakerNames((prev) => {
-        const forWs = { ...(prev[wsKey] ?? {}) };
-        if (data.name) forWs[label] = data.name;
-        else delete forWs[label];
-        return { ...prev, [wsKey]: forWs };
-      });
-      return data.name;
-    },
-    [],
-  );
-
-  const maybeFetchTranscripts = useCallback(
-    async (t: Task) => {
-      if (!t.stages.some((s) => s.id === "transcribe" && s.status === "done")) return;
-      if (requestedTranscripts.current.has(t.id)) return;
-      requestedTranscripts.current.add(t.id);
-      const result = await fetchTranscripts(t.id);
-      setTranscripts((prev) => ({
-        ...prev,
-        [t.id]: result.ok ? result.data : "error",
-      }));
-    },
-    [],
-  );
-
-  const maybeFetchCheck = useCallback(async (t: Task) => {
-    if (!t.stages.some((s) => s.id === "diarize" && s.status === "done")) return;
-    const active = t.voiceprint_check && ["queued", "running"].includes(t.voiceprint_check.state);
-    if (!active && requestedChecks.current.has(t.id)) return;
-    requestedChecks.current.add(t.id);
-    const result = await getVoiceprintCheck(t.id);
-    // 失败时不动状态，下一轮轮询重试
-    if (result.ok) {
-      const data = result.data;
-      setCheckStates((prev) => ({ ...prev, [t.id]: data }));
-    }
-  }, []);
-
-  const refreshWorkspaces = useCallback(async () => {
-    const result = await listWorkspaces();
-    // 后端暂不可达时保留旧列表，下一轮重试
-    if (result.ok) {
-      const data = result.data;
-      setWorkspaces(data);
-    }
-  }, []);
-
-  const refreshVoiceprints = useCallback(async () => {
-    const result = await listVoiceprints();
-    // 后端暂不可达时保留旧列表，下一轮重试
-    if (result.ok) {
-      const data = result.data;
-      setVoiceprints(data);
-    }
-  }, []);
-
-  const refresh = useCallback(async () => {
-    const result = await listTasks();
-    // 后端暂不可达时保留旧列表，下一轮重试
-    if (result.ok) {
-      const data = result.data;
-      setTasks(data.tasks);
-      data.tasks.forEach(maybeFetchTimeline);
-      data.tasks.forEach(maybeFetchTranscripts);
-      data.tasks.forEach(maybeFetchCheck);
-    }
-    refreshWorkspaces();
-    refreshVoiceprints();
-  }, [maybeFetchTimeline, maybeFetchTranscripts, maybeFetchCheck, refreshWorkspaces, refreshVoiceprints]);
-
-  useEffect(() => {
-    refresh();
-    const timer = setInterval(refresh, 1000);
-    return () => clearInterval(timer);
-  }, [refresh]);
-
-  useEffect(() => {
-    return () => {
-      audioRef.current?.pause();
-      audioRef.current = null;
-    };
-  }, []);
-
-  // 试听中的移动播放条位置：音频接口从 start 处切片，currentTime 是相对
-  // 偏移，需加 playing.start 才是绝对时间；结束/出错时随 playing 复位。
-  useEffect(() => {
-    if (!playing) {
-      setPlayPos(null);
-      return;
-    }
-    let raf = 0;
-    const tick = () => {
-      const audio = audioRef.current;
-      if (audio && !audio.paused && !audio.ended) {
-        setPlayPos(Math.min(playing.end, playing.start + audio.currentTime));
-        raf = requestAnimationFrame(tick);
-      }
-    };
-    raf = requestAnimationFrame(tick);
-    return () => cancelAnimationFrame(raf);
-  }, [playing]);
-
-  function playSegment(
-    taskId: string,
-    speaker: string,
-    seg: Pick<TimelineSegment, "start" | "end">,
-  ) {
-    if (!audioRef.current) audioRef.current = new Audio();
-    const audio = audioRef.current;
-    audio.pause();
-    audio.src = audioSegmentUrl(taskId, seg);
-    audio.onended = () => setPlaying(null);
-    audio.play().catch(() => setPlaying(null));
-    setPlaying({ taskId, speaker, start: seg.start, end: seg.end });
-  }
-
-  async function handleProbe() {
-    setFormError(null);
-    setProbe(null);
-    if (!videoPath.trim()) {
-      setFormError("请先填写源视频的本地路径");
-      return;
-    }
-    setProbing(true);
-    const result = await probeVideo(videoPath.trim());
-    setProbing(false);
-    if (!result.ok) {
-      setFormError(errorMessage(result, "探测失败"));
-      return;
-    }
-    const data = result.data;
-    setProbe(data);
-    setSelectedTrack(0);
-    if (data.tracks.length === 0) setFormError("该视频没有音轨");
-  }
-
-  async function handleSubmit(e: React.FormEvent) {
-    e.preventDefault();
-    setFormError(null);
-    if (!videoPath.trim()) {
-      setFormError("请先填写源视频的本地路径");
-      return;
-    }
-    const result = await createTask({
-      video_path: videoPath.trim(),
-      audio_track: probe && probe.tracks.length > 0 ? selectedTrack : null,
-      num_speakers: numSpeakers.trim() ? Number(numSpeakers.trim()) : null,
-    });
-    if (!result.ok) {
-      setFormError(errorMessage(result, "提交失败"));
-      return;
-    }
-    refresh();
-  }
-
-  async function handleCancel(id: string) {
-    await cancelTask(id);
-    refresh();
-  }
-
-  async function handleResume(id: string) {
-    setResumeError(null);
-    const result = await resumeTask(id);
-    if (!result.ok) {
-      setResumeError(errorMessage(result, "续跑失败"));
-      return;
-    }
-    refresh();
-  }
-
-  async function handleResumeWorkspace(w: WorkspaceItem) {
-    setWorkspaceError(null);
-    const result = await resumeWorkspace(w.name);
-    if (!result.ok) {
-      setWorkspaceError(errorMessage(result, "续跑失败"));
-      return;
-    }
-    refresh();
-  }
-
-  async function handleOpenWorkspace(w: WorkspaceItem) {
-    setWorkspaceError(null);
-    const result = await openWorkspace(w.name);
-    if (!result.ok) {
-      setWorkspaceError(errorMessage(result, "打开擦除界面失败"));
-      return;
-    }
-    refresh();
-  }
-
-  async function handleDeleteWorkspace(w: WorkspaceItem) {
-    const confirmed = window.confirm(
-      `删除工作区「${w.name}」？\n\n释放 ${w.size_label}，` +
-        `全部中间产物一并删除。\n再次处理该源视频需要从头分析（数小时）。`,
-    );
-    if (!confirmed) return;
-    setWorkspaceError(null);
-    const result = await deleteWorkspace(w.name);
-    if (!result.ok) {
-      setWorkspaceError(errorMessage(result, "删除工作区失败"));
-      return;
-    }
-    refresh();
-  }
-
-  async function handleStoreVoiceprint(task: Task, label: string) {
-    const key = `${task.id}:${label}`;
-    if (voiceprintBusy[key]) return;
-    const timeline = timelines[task.id];
-    const speaker =
-      timeline === "error" || timeline === undefined
-        ? undefined
-        : timeline.speakers.find((sp) => sp.label === label);
-    const name =
-      speakerNames[workspaceKey(task)]?.[label] ?? speaker?.name ?? null;
-    if (!name) {
-      setIngestWarnings((prev) => ({
-        ...prev,
-        [task.id]: "请先命名说话人，再存入声纹库",
-      }));
-      return;
-    }
-
-    setVoiceprintBusy((prev) => ({ ...prev, [key]: true }));
-    setIngestWarnings((prev) => ({ ...prev, [task.id]: null }));
-    const result = await storeSpeakerVoiceprint(task.id, label);
-    if (!result.ok) {
-      setIngestWarnings((prev) => ({
-        ...prev,
-        [task.id]: errorMessage(result, "存入声纹库失败"),
-      }));
-    } else {
-      const data = result.data;
-      setIngestWarnings((prev) => ({
-        ...prev,
-        [task.id]: data?.voiceprint_error
-          ? `声纹入库失败：${data.voiceprint_error}`
-          : null,
-      }));
-    }
-    setVoiceprintBusy((prev) => ({ ...prev, [key]: false }));
-    refreshVoiceprints();
-  }
-
-  async function handleDeleteVoiceprint(name: string) {
-    const confirmed = window.confirm(
-      `从声纹库删除「${name}」？\n\n后续剧集将不再自动识别该人物。`,
-    );
-    if (!confirmed) return;
-    setVoiceprintError(null);
-    const result = await deleteVoiceprintEntry(name);
-    if (!result.ok) {
-      setVoiceprintError(errorMessage(result, "删除声纹失败"));
-      return;
-    }
-    refreshVoiceprints();
-  }
+  // 局部别名：让下方的渲染代码与拆分前逐字一致。
+  const { timelines, speakerNames } = timelineStore;
+  const { tasks, transcripts, workspaces, voiceprints } = polling;
+  const {
+    correctionError,
+    reassignSegment,
+    splitSegment,
+    deleteSegment,
+    discardCorrections,
+  } = corrections;
+  const {
+    ingestWarnings,
+    voiceprintBusy,
+    renameSpeaker,
+    handleStoreVoiceprint,
+  } = naming;
+  const {
+    checkStates,
+    checkError,
+    decisionBusy,
+    startVoiceprintCheck,
+    cancelVoiceprintCheck,
+    decideSuggestion,
+  } = voiceprintCheck;
+  const { voiceprintError, handleDeleteVoiceprint } = library;
+  const {
+    workspaceError,
+    handleResumeWorkspace,
+    handleOpenWorkspace,
+    handleDeleteWorkspace,
+  } = workspaceActions;
+  const { resumeError, handleCancel, handleResume } = taskActions;
+  const {
+    videoPath,
+    setVideoPath,
+    probe,
+    selectedTrack,
+    setSelectedTrack,
+    numSpeakers,
+    setNumSpeakers,
+    formError,
+    probing,
+    handleProbe,
+    handleSubmit,
+  } = submitForm;
+  const { playing, playPos, playSegment } = playback;
 
   function renderTimeline(t: Task) {
     const timeline = timelines[t.id];
@@ -571,55 +190,6 @@ export default function App() {
         )}
       </>
     );
-  }
-
-  async function startVoiceprintCheck(t: Task) {
-    setCheckError(null);
-    const result = await postVoiceprintCheck(t.id);
-    if (!result.ok) {
-      setCheckError(errorMessage(result, "声纹校验启动失败"));
-      return;
-    }
-    const check = result.data.voiceprint_check;
-    if (check) {
-      setCheckStates((prev) => ({
-        ...prev,
-        [t.id]: { ...check, result: null },
-      }));
-    }
-  }
-
-  async function cancelVoiceprintCheck(t: Task) {
-    setCheckError(null);
-    const result = await deleteVoiceprintCheck(t.id);
-    if (!result.ok) {
-      setCheckError(errorMessage(result, "取消声纹校验失败"));
-    }
-  }
-
-  async function decideSuggestion(t: Task, index: number, decision: "accept" | "ignore") {
-    const key = `${t.id}:${index}`;
-    if (decisionBusy[key]) return;
-    setDecisionBusy((prev) => ({ ...prev, [key]: true }));
-    setCheckError(null);
-    const result = await postSuggestionDecision(t.id, index, decision);
-    if (!result.ok) {
-      setCheckError(errorMessage(result, "建议裁决失败"));
-    } else {
-      const data = result.data;
-      setCheckStates((prev) => ({
-        ...prev,
-        [t.id]: {
-          ...(prev[t.id] ?? { state: "completed", progress: 1, error: null }),
-          state: "completed",
-          progress: 1,
-          error: null,
-          result: data.result,
-        },
-      }));
-      applyTimeline({ taskId: t.id, workspaceKey: workspaceKey(t), timeline: data.timeline });
-    }
-    setDecisionBusy((prev) => ({ ...prev, [key]: false }));
   }
 
   function suggestionText(s: VoiceprintSuggestion): string {
