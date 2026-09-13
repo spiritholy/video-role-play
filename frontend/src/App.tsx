@@ -8,306 +8,50 @@ import {
   type MouseEvent as ReactMouseEvent,
   type PointerEvent as ReactPointerEvent,
 } from "react";
-
-interface Stage {
-  id: string;
-  name: string;
-  status: "pending" | "running" | "done" | "failed" | "cancelled";
-  error: string | null;
-  artifacts: string[];
-  progress: number | null;
-  outputs: Record<string, string>;
-}
-
-const STEM_LABELS: Record<string, string> = {
-  vocal: "人声轨",
-  accompaniment: "伴奏轨",
-};
-
-interface TimelineSegment {
-  start: number;
-  end: number;
-  index: number;
-}
-
-interface CorrectionStatus {
-  state: "none" | "active" | "invalidated";
-  revision: number;
-  message: string | null;
-  editable: boolean;
-  locked_reason: string | null;
-}
-
-interface TimelineSpeaker {
-  label: string;
-  name: string | null;
-  auto?: boolean;  // 名字是否自动认出来的（手工命名优先，不标自动）
-  speech_time: number;
-  segments: TimelineSegment[];
-}
-
-interface Timeline {
-  model: string;
-  num_speakers: number;
-  duration: number;
-  speakers: TimelineSpeaker[];
-  correction: CorrectionStatus;
-}
-
-type TimelineOrError = Timeline | "error";
-
-interface TranscriptSample {
-  speaker: string;
-  start: number;
-  end: number;
-  text: string;
-}
-
-interface Transcripts {
-  model: string;
-  samples: TranscriptSample[];
-}
-
-type TranscriptsOrError = Transcripts | "error";
-
-interface TimelineUpdate {
-  taskId: string;
-  workspaceKey: string;
-  timeline: Timeline;
-}
-
-interface Playing {
-  taskId: string;
-  speaker: string;
-  start: number;
-  end: number;
-}
-
-const SPEAKER_COLORS = [
-  "#4f7cff", "#e0533d", "#2ba24c", "#9d5bd2",
-  "#e8a13a", "#2ab5b5", "#d45791", "#7a8699",
-];
-
-// 总览中时段的最小可视宽度：短时段至少 1px，便于发现；大量短时段超过
-// 轨道容量时允许相邻时段视觉覆盖，不再靠横向滚动或整片放大来显示。
-const MIN_SEG_PX = 1;
-
-function speakerColor(speakers: TimelineSpeaker[], label: string): string {
-  const i = speakers.findIndex((s) => s.label === label);
-  return SPEAKER_COLORS[i % SPEAKER_COLORS.length];
-}
-
-function fmtTime(t: number): string {
-  if (t < 60) return `${t.toFixed(1)}s`;
-  const m = Math.floor(t / 60);
-  const s = Math.round(t % 60);
-  return `${m}:${String(s).padStart(2, "0")}`;
-}
-
-function shownName(names: Record<string, string>, sp: TimelineSpeaker): string {
-  return names[sp.label] ?? sp.name ?? sp.label;
-}
-
-function isSegmentActive(
-  taskId: string,
-  playing: Playing | null,
-  speaker: string,
-  seg: Pick<TimelineSegment, "start" | "end">,
-): boolean {
-  return (
-    playing !== null &&
-    playing.taskId === taskId &&
-    playing.speaker === speaker &&
-    playing.start === seg.start &&
-    playing.end === seg.end
-  );
-}
-
-// 全片所有时段按时间排序（用于总览选中定位与保存后的停留定位）。
-function orderedSegmentsOf(
-  timeline: Timeline,
-): { speaker: string; segment: TimelineSegment }[] {
-  const items: { speaker: string; segment: TimelineSegment }[] = [];
-  for (const sp of timeline.speakers) {
-    for (const seg of sp.segments) {
-      items.push({ speaker: sp.label, segment: seg });
-    }
-  }
-  items.sort(
-    (a, b) => a.segment.start - b.segment.start || a.segment.end - b.segment.end,
-  );
-  return items;
-}
-
-function firstSegment(
-  timeline: Timeline,
-): { speaker: string; segment: TimelineSegment } | null {
-  for (const sp of timeline.speakers) {
-    if (sp.segments.length > 0) {
-      return { speaker: sp.label, segment: sp.segments[0] };
-    }
-  }
-  return null;
-}
-
-// 切分结果区间最小宽度（秒），与后端校验保持一致。
-const MIN_SPLIT_SECONDS = 0.1;
-const SPLIT_EPS = 1e-9;
-
-interface SplitInterval {
-  key: string;
-  start: number;
-  end: number;
-}
-
-// 保存切分时的结果区间协议：target 为现有说话人标签；"__new__" 表示新建
-// 说话人，slot 是草稿内的槽位标识（同一槽位后端映射为同一个 SPEAKER_XX）。
-interface SplitResult {
-  start: number;
-  end: number;
-  target: string;
-  slot?: string;
-}
-
-// 由间隔线推导相邻结果区间：起点/间隔线/终点顺序切分。
-function splitIntervals(start: number, end: number, markers: number[]): SplitInterval[] {
-  const points = [start, ...markers, end];
-  return points.slice(0, -1).map((a, i) => ({
-    key: `iv${i}`,
-    start: a,
-    end: points[i + 1],
-  }));
-}
-
-// 新建说话人槽位的 API 协议标记（与后端保持一致）。
-const NEW_SLOT_TOKEN = "__new__";
-const NEW_SLOT_PREFIX = "new-slot-";
-
-function isNewSlotTarget(target: string | undefined): boolean {
-  return Boolean(target && target.startsWith(NEW_SLOT_PREFIX));
-}
-
-interface Task {
-  id: string;
-  video_path: string;
-  audio_track: number | null;
-  state: "queued" | "running" | "completed" | "failed" | "cancelled";
-  state_label: string;
-  error: string | null;
-  stages: Stage[];
-  output_path: string | null;
-  workspace_dir: string | null;
-  erase: { speakers: string[]; output_dir: string | null } | null;
-  voiceprint_check?: VoiceprintCheckState | null;
-  created_at: string;
-}
-
-interface VoiceprintSuggestion {
-  type: "rename" | "merge" | "reassign";
-  decision?: "pending" | "accepted" | "ignored";
-  label?: string;
-  name?: string;
-  similarity?: number;
-  labels?: string[];
-  canonical?: string;
-  from_label?: string;
-  to_label?: string;
-  start?: number;
-  end?: number;
-}
-
-interface VoiceprintCheckResult {
-  status?: "pending" | "invalidated";
-  suggestions: VoiceprintSuggestion[];
-}
-
-interface VoiceprintCheckState {
-  state: "not_run" | "queued" | "running" | "completed" | "failed" | "cancelled";
-  progress: number;
-  error: string | null;
-  result?: VoiceprintCheckResult | null;
-}
-
-interface ProbeTrack {
-  index: number;
-  stream_index: number;
-  codec: string | null;
-  channels: number | null;
-  channel_layout: string | null;
-  language: string | null;
-}
-
-interface WorkspaceItem {
-  name: string;
-  path: string;
-  source_path: string | null;
-  size_bytes: number;
-  size_label: string;
-  reusable: boolean;
-  openable: boolean;
-  resumable: boolean;
-  busy: boolean;
-}
-
-interface WorkspaceList {
-  workspaces: WorkspaceItem[];
-  total_bytes: number;
-  total_label: string;
-}
-
-interface ProbeResult {
-  container: string;
-  duration: number;
-  tracks: ProbeTrack[];
-}
-
-interface VoiceprintName {
-  name: string;
-  vectors_count: number;
-  source_workspace: string | null;
-  updated_at: string | null;
-}
-
-interface VoiceprintList {
-  revision: number;
-  model: string;
-  names: VoiceprintName[];
-}
-
-function trackLabel(t: ProbeTrack): string {
-  const parts = [`音轨 ${t.index + 1}`, t.codec ?? "未知编码"];
-  if (t.channels != null) {
-    parts.push(
-      t.channel_layout ? `${t.channel_layout}（${t.channels} 声道）` : `${t.channels} 声道`
-    );
-  }
-  if (t.language) parts.push(`语言 ${t.language}`);
-  return parts.join(" · ");
-}
-
-function stageSummary(task: Task): string {
-  if (task.state === "completed") {
-    const eraseStage = task.stages.find((s) => s.id === "encode_mux");
-    return eraseStage?.status === "done" ? "擦除完成" : "分析完成，可选择要擦除的说话人";
-  }
-  const idx = task.stages.findIndex((s) => s.status === "running");
-  if (idx >= 0) return `阶段 ${idx + 1}/${task.stages.length} · ${task.stages[idx].name}`;
-  const firstUndone = task.stages.findIndex(
-    (s) => s.status !== "done" && s.status !== "cancelled"
-  );
-  if (firstUndone >= 0) return `阶段 ${firstUndone + 1}/${task.stages.length} · ${task.stages[firstUndone].name}`;
-  return "";
-}
-
-function audioUrl(taskId: string, artifact: string): string {
-  return `/api/tasks/${taskId}/audio/${
-    artifact.split("/").map(encodeURIComponent).join("/")
-  }`;
-}
-
-function workspaceKey(t: Task): string {
-  return t.workspace_dir ?? t.id;
-}
+import { audioUrl } from "./api/urls";
+import {
+  dirName,
+  fileName,
+  fmtTime,
+  stageSummary,
+  trackLabel,
+} from "./lib/format";
+import { STEM_LABELS } from "./lib/labels";
+import {
+  MIN_SEG_PX,
+  firstSegment,
+  isSegmentActive,
+  orderedSegmentsOf,
+} from "./lib/segments";
+import { speakerColor, shownName } from "./lib/speakers";
+import {
+  MIN_SPLIT_SECONDS,
+  NEW_SLOT_TOKEN,
+  SPLIT_EPS,
+  isNewSlotTarget,
+  splitIntervals,
+} from "./lib/split";
+import { workspaceKey } from "./lib/workspace";
+import type {
+  Playing,
+  ProbeResult,
+  SplitInterval,
+  SplitResult,
+  Task,
+  Timeline,
+  TimelineOrError,
+  TimelineSegment,
+  TimelineSpeaker,
+  TimelineUpdate,
+  TranscriptSample,
+  Transcripts,
+  TranscriptsOrError,
+  VoiceprintCheckState,
+  VoiceprintList,
+  VoiceprintSuggestion,
+  WorkspaceItem,
+  WorkspaceList,
+} from "./types";
 
 export default function App() {
   const [tasks, setTasks] = useState<Task[]>([]);
@@ -1333,11 +1077,6 @@ export default function App() {
   );
 }
 
-function fileName(path: string): string {
-  const i = Math.max(path.lastIndexOf("/"), path.lastIndexOf("\\"));
-  return i >= 0 ? path.slice(i + 1) : path;
-}
-
 function EraseForm({
   task,
   speakers,
@@ -1426,11 +1165,6 @@ function EraseForm({
       {error && <p className="error-text">{error}</p>}
     </div>
   );
-}
-
-function dirName(path: string): string {
-  const i = Math.max(path.lastIndexOf("/"), path.lastIndexOf("\\"));
-  return i >= 0 ? path.slice(0, i) : "";
 }
 
 function SpeakerTimeline({
