@@ -1,0 +1,48 @@
+/* 选中时段操作面板占位 */
+.operation-panel {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  padding: 12px 14px;
+  border: 1px solid #e5e6eb;
+  border-radius: 8px;
+  background: #f7f8fa;
+}
+
+.operation-panel-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 14px;
+}
+
+.operation-panel-head .dot {
+  width: 10px;
+  height: 10px;
+  border-radius: 50%;
+  flex: none;
+}
+
+.operation-panel-meta {
+  font-size: 13px;
+  color: #86909c;
+  font-family: ui-monospace, "SF Mono", Consolas, monospace;
+}
+
+.operation-panel-playing {
+  margin-left: auto;
+  font-size: 12px;
+  color: #2ba24c;
+}
+
+.operation-panel-hint {
+  margin: 0;
+  font-size: 13px;
+  color: #86909c;
+}
+
+.operation-panel-actions {
+  display: flex;
+  gap: 8px;
+}
+

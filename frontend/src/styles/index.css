@@ -1,0 +1,13 @@
+/* 全局样式入口：按组件顺序导入，顺序即层叠顺序，勿调整。 */
+@import "./base.css"; /* 基础排版、提交表单、通用按钮与任务列表容器 */
+@import "./task-card.css"; /* 任务卡片、状态徽标、阶段 chips 与分轨试听 */
+@import "./timeline.css"; /* 说话人时间轴、时段轨道与样本台词 */
+@import "./erase-form.css"; /* 擦除目标说话人表单 */
+@import "./workspace.css"; /* 工作区列表与占用统计 */
+@import "./speaker-badge.css"; /* 自动命名「自动」徽标 */
+@import "./voiceprint-library.css"; /* 人物声纹库面板 */
+@import "./correction.css"; /* 校正警告、时段包裹与改派对话框 */
+@import "./voiceprint-check.css"; /* 按需声纹校验与建议列表 */
+@import "./detail-modal.css"; /* 校正详情弹窗、全片总览与放大镜 */
+@import "./operation-panel.css"; /* 选中时段操作面板 */
+@import "./split-panel.css"; /* 时段切分面板：间隔线与结果区间 */

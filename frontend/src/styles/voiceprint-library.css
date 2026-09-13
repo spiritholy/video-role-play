@@ -1,0 +1,65 @@
+/* 人物声纹库面板 */
+.voiceprint-panel {
+  background: #fff;
+  border: 1px solid #e5e6eb;
+  border-radius: 10px;
+  padding: 12px 14px;
+  margin-bottom: 12px;
+}
+
+.voiceprint-title {
+  font-size: 14px;
+  font-weight: 600;
+  color: #1f2329;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.voiceprint-meta {
+  font-size: 12px;
+  font-weight: 400;
+  color: #86909c;
+}
+
+.voiceprint-hint {
+  margin: 6px 0 8px;
+  font-size: 12px;
+  color: #86909c;
+}
+
+.voiceprint-row {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 10px;
+  padding: 6px 0;
+  border-top: 1px dashed #eef0f3;
+}
+
+.voiceprint-row:first-of-type {
+  border-top: none;
+}
+
+.voiceprint-name {
+  font-size: 13px;
+  font-weight: 600;
+  font-family: ui-monospace, "SF Mono", Consolas, monospace;
+}
+
+.voiceprint-count {
+  font-size: 12px;
+  color: #4b5960;
+}
+
+.voiceprint-source {
+  font-size: 12px;
+  color: #86909c;
+  word-break: break-all;
+}
+
+.voiceprint-row button.delete {
+  margin-left: auto;
+}
+
+
