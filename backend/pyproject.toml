@@ -3,6 +3,7 @@ name = "video-role-play-backend"
 version = "0.1.0"
 description = "视频人声擦除/角色扮演后端（FastAPI + ML 推理）"
 requires-python = ">=3.10,<3.11"
+license = "MIT"
 dependencies = [
   "fastapi==0.115.6",
   "uvicorn==0.34.0",

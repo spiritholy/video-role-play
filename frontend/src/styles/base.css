@@ -1,0 +1,109 @@
+* {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+  font-family: "PingFang SC", "Microsoft YaHei", "Noto Sans CJK SC", sans-serif;
+  background: #f5f6f8;
+  color: #1f2329;
+}
+
+.app {
+  max-width: 860px;
+  margin: 0 auto;
+  padding: 24px 16px 64px;
+}
+
+h1 {
+  font-size: 24px;
+  margin: 8px 0 24px;
+}
+
+h2 {
+  font-size: 18px;
+  margin: 0 0 12px;
+}
+
+.submit-form {
+  background: #fff;
+  border: 1px solid #e5e6eb;
+  border-radius: 10px;
+  padding: 16px;
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+
+.path-row {
+  display: flex;
+  gap: 8px;
+}
+
+.path-row input {
+  flex: 1;
+}
+
+input[type="text"],
+select {
+  padding: 8px 10px;
+  border: 1px solid #c9cdd4;
+  border-radius: 6px;
+  font-size: 14px;
+}
+
+button {
+  padding: 8px 14px;
+  border: 1px solid #c9cdd4;
+  border-radius: 6px;
+  background: #fff;
+  font-size: 14px;
+  cursor: pointer;
+}
+
+button:hover:not(:disabled) {
+  border-color: #4b5ffe;
+  color: #4b5ffe;
+}
+
+button:disabled {
+  opacity: 0.6;
+  cursor: not-allowed;
+}
+
+button.primary {
+  align-self: flex-start;
+  background: #4b5ffe;
+  border-color: #4b5ffe;
+  color: #fff;
+}
+
+button.primary:hover:not(:disabled) {
+  background: #3a4ce0;
+  color: #fff;
+}
+
+.error-text {
+  color: #c62f2f;
+  margin: 0;
+  font-size: 13px;
+  white-space: pre-wrap;
+  word-break: break-all;
+}
+
+.output-text {
+  color: #2f7d33;
+  margin: 0;
+  font-size: 13px;
+  word-break: break-all;
+}
+
+.tasks {
+  margin-top: 24px;
+}
+
+.empty {
+  color: #86909c;
+  font-size: 14px;
+}
+
