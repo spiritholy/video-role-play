@@ -1,6 +1,6 @@
 """处理任务领域模型：状态、阶段与序列化。
 
-词汇遵循 CONTEXT.md：处理任务、工作区、成品视频。
+词汇遵循 GLOSSARY.md：处理任务、工作区、成品视频。
 """
 
 from __future__ import annotations

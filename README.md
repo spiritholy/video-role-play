@@ -83,7 +83,7 @@ cd frontend && pnpm test         # vitest
 
 ## 项目文档
 
-- [`CONTEXT.md`](CONTEXT.md) — 领域术语表（说话人时段、切分草稿、人工校正、声纹库等的确切含义）
+- [`GLOSSARY.md`](GLOSSARY.md) — 领域术语表（说话人时段、切分草稿、人工校正、声纹库等的确切含义）
 - [`docs/adr/`](docs/adr/) — 架构决策记录
 - [`THIRD-PARTY-NOTICES.md`](THIRD-PARTY-NOTICES.md) — 第三方依赖与模型权重的许可归属
 

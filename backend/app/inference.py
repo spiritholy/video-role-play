@@ -45,7 +45,7 @@ class SeparationStems:
 
 @dataclass(frozen=True)
 class SpeakerSegment:
-    """说话人时段（CONTEXT.md：某个说话人正在说话的时间区间）。"""
+    """说话人时段（GLOSSARY.md：某个说话人正在说话的时间区间）。"""
 
     speaker: str
     start: float
