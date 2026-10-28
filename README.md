@@ -39,6 +39,12 @@ $EDITOR .env            # 把 HF_TOKEN= 填上
 ./run.sh                # 装依赖 → 构建前端 → 启动 → 打开浏览器
 ```
 
+也可以改用首次配置向导，它会逐步检查前置工具、引导接受模型许可、写入 token 并说明首次启动：
+
+```bash
+./scripts/setup-wizard.sh
+```
+
 启动后访问 http://127.0.0.1:8770（`Ctrl+C` 退出）。
 
 `run.sh` 等价于 `uv sync` + `pnpm build` + `backend/.venv/bin/python run.py`，中国大陆网络下 PyPI 直连失败会自动回退到清华镜像。
